@@ -9,6 +9,7 @@ from websockets.exceptions import ConnectionClosed
 from difflib import SequenceMatcher
 
 logger = logging.getLogger("voice_agent")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s", datefmt="%H:%M:%S")
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -47,6 +48,8 @@ SYSTEM_PROMPT = (
     "conversational since they will be spoken aloud."
 )
 
+BARGE_IN_RMS_RATIO = 0.02
+MAX_AMP=32768.0
 
 async def _connect_deepgram(url: str):
     """Connect to a Deepgram websocket, tolerating both old and new
@@ -90,6 +93,7 @@ class CustomVoiceAgent:
         self._tts_first_send_ts = None
         self._last_audio_out_ts = None
 
+
     async def run(self):
         """Orchestrates system loops and guarantees cleanup on exit,
         whether that exit is a client disconnect or an unhandled error
@@ -129,87 +133,57 @@ class CustomVoiceAgent:
                     pass
         logger.info("Session cleaned up.")
 
-    @staticmethod
-    def _chunk_rms(chunk: bytes) -> float:
-        """Compute RMS of Int16 PCM chunk (linear16, little-endian)."""
-        if not chunk or len(chunk) < 2:
-            return 0.0
-        # Convert bytes to array of int16 samples
-        samples = [int.from_bytes(chunk[i:i+2], "little", signed=True)
-                   for i in range(0, len(chunk), 2)]
-        if not samples:
-            return 0.0
-        mean_sq = sum(s * s for s in samples) / len(samples)
-        return mean_sq ** 0.5
-
+# adds audio to the audio_in_queue
     async def read_client_mic_loop(self):
         """Task 1: intercepts raw binary audio chunks from the client."""
         while True:
             message = await self.client_ws.receive_bytes()
-            # Skip near-silent chunks (echo, breath, residual TTS leakage)
-            # to reduce false VAD triggers.
-            rms = self._chunk_rms(message)
-            max_amp = 32768.0
-            ratio = rms / max_amp
-            self._last_rms = rms
-            # logger.info("rms: %.0f  ratio: %.4f (threshold %.4f)", rms, ratio, self.audio_threshold_ratio)
-            if ratio < self.audio_threshold_ratio:
-                continue
             await self.audio_in_queue.put(message)
 
+# sends audio to deepgram and receives text via websocket
     async def deepgram_stt_loop(self):
         """Task 2: full-duplex pipe driving live Deepgram STT."""
         self._dg_stt_ws = await _connect_deepgram(DEEPGRAM_STT_URL)
         dg_ws = self._dg_stt_ws
         logger.info("Connected to Deepgram STT.")
 
+# get audio chunks from the audio_in_queue and forward to deepgram
         async def forward_audio_to_dg():
             while True:
                 chunk = await self.audio_in_queue.get()
-                # logger.info("chunk inside stt loop: %d bytes", len(chunk))
                 await dg_ws.send(chunk)
                 self._last_audio_sent_ts = time.monotonic()
                 self.audio_in_queue.task_done()
 
+
         async def handle_dg_responses():
             while True:
-                msg = await dg_ws.recv()
-                data = json.loads(msg)
+                try:
+                    msg = await dg_ws.recv()
+                    data = json.loads(msg)
+                except json.JSONDecodeError:
+                    logger.warning("Non-JSON message from Deepgram, skipping.")
+                    continue
         
-                # Only treat as real barge-in when audio is clearly loud
-                # (ratio > 0.15) to avoid false triggers on quick replies.
-                loud_interruption = False
-                if data.get("type") == "SpeechStarted" and self.is_ai_speaking:
-                    last_rms = getattr(self, "_last_rms", 0.0)
-                    ratio_now = last_rms / 32768.0 if last_rms else 0
-                    if ratio_now > 0.05:  # only very loud overlap counts
-                        loud_interruption = True
-                    logger.info("SpeechStarted (ratio=%.4f, is_ai_speaking=%s, loud=%s)",
-                                ratio_now, self.is_ai_speaking, loud_interruption)
-                if data.get("type") == "SpeechStarted" and self.is_ai_speaking and loud_interruption:
-                    # Log ratio at the moment of interruption so false triggers
-                    # can be debugged against audio threshold.
-                    last_rms = getattr(self, "_last_rms", 0.0)
-                    logger.info("Barge-in detected (ratio=%.4f, is_ai_speaking=%s)",
-                                last_rms / 32768.0 if last_rms else 0, self.is_ai_speaking)
-                    logger.info("Barge-in detected, purging pipeline queues.")
-                    self.interruption_event.set()
-                    await self._purge_pipeline()
-
-                if self.interruption_event.is_set():
-                    # During interruption, discard any partial interim transcript
-                    # that might have been accumulated before purge, but let
-                    # speech_final through so the user's new turn can start.
-                    if data.get("type") == "Results" and not data.get("speech_final"):
-                        self.transcript_accumulator = ""
-                        continue
+                msg_type = data.get("type")
         
-                if data.get("type") == "Results":
+                if msg_type == "Results":
                     alt = data.get("channel", {}).get("alternatives", [{}])[0]
                     transcript = alt.get("transcript", "")
-                    if transcript and data.get("is_final"):
-                        self.transcript_accumulator += f" {transcript}"
-        
+
+                    if transcript:
+                        logger.info("Interim transcript fragment: %r (is_final=%s) (is_speech_final=%d)", transcript, data.get("is_final"), data.get("speech_final"))
+
+# looks for the first word the user speaks => clears transcript => purges pipeline => data.get("is_final") & data.get("speech_final") evaluates to false => next iteration of the loop starts
+                        if self.is_ai_speaking and not self.interruption_event.is_set():
+                            logger.info("Barge-in detected via transcript: %r", transcript)
+                            self.interruption_event.set()
+                            self.transcript_accumulator = ""
+                            await self._purge_pipeline()
+
+                        if data.get("is_final"):
+                            self.transcript_accumulator += f" {transcript}"
+
                     if data.get("speech_final") and self.transcript_accumulator.strip():
                         final_text = self.transcript_accumulator.strip()
                         if self._last_audio_sent_ts:
@@ -240,25 +214,16 @@ class CustomVoiceAgent:
                     if self.interruption_event.is_set():
                         logger.info("No new turn after interruption; clearing event.")
                         self.interruption_event.clear()
-                        self.transcript_accumulator = ""
                         self.is_ai_speaking = False
                         continue
                     else:
                         continue
-                if self.conversation_history:
-                    last_model_turns = [t for t in self.conversation_history if t["role"] == "model"]
-                    if last_model_turns:
-                        last_reply = last_model_turns[-1]["parts"][0]["text"]
-                        similarity = SequenceMatcher(None, prompt.lower(), last_reply.lower()).ratio()
-                        if similarity > 0.6:
-                            logger.info("Discarding likely echo transcript (similarity %.2f): %r", similarity, prompt)
-                            continue
+               
                 if self._speech_final_ts:
                     logger.info("Time from speech end to Gemini dispatch: %.3fs", time.monotonic() - self._speech_final_ts)
                 self._gemini_request_ts = time.monotonic()
                 self._tts_first_send_ts = None 
                 logger.info("Sending prompt to Gemini: %r", prompt)
-                self.interruption_event.clear()
                 self.sentence_buffer = ""
 
                 self.conversation_history.append(
@@ -290,15 +255,22 @@ class CustomVoiceAgent:
                                 text_token = (
                                     chunk["candidates"][0]["content"]["parts"][0]["text"]
                                 )
-                            except (KeyError, IndexError, json.JSONDecodeError):
+                            except (KeyError, IndexError, json.JSONDecodeError) as e:
+                                logger.warning("Unparseable Gemini chunk: %r (%s)", data_str, e)
                                 continue
 
                             full_reply += text_token
                             if not first_token_logged:
+                                self.interruption_event.clear()
                                 logger.info("Gemini time to first token: %.3fs", time.monotonic() - self._gemini_request_ts)
                                 first_token_logged = True
                             await self._buffer_and_dispatch(text_token)
 
+                        if not full_reply.strip():
+                            logger.warning(
+                                "Empty Gemini response for prompt %r (interrupted=%s)",
+                                prompt, self.interruption_event.is_set()
+                            )
                         logger.info("Gemini total time to final token: %.3fs", time.monotonic() - self._gemini_request_ts)
 
                             
@@ -312,7 +284,7 @@ class CustomVoiceAgent:
                 await self.tts_text_queue.put({"flush": True})
                 self.sentence_buffer = ""
 
-                if full_reply.strip():
+                if full_reply.strip() and not self.interruption_event.is_set():
                     self.conversation_history.append(
                         {"role": "model", "parts": [{"text": full_reply}]}
                     )
@@ -382,7 +354,7 @@ class CustomVoiceAgent:
             # Use near-zero decay so False barge-in from finished AI
             # doesn't keep is_ai_speaking alive.
             decay = (self._last_audio_out_ts is None or
-                     (time.monotonic() - self._last_audio_out_ts) > 0.05)
+                     (time.monotonic() - self._last_audio_out_ts) > 0.1)
             if (self.audio_out_queue.empty() and self.tts_text_queue.empty() and decay and not self.interruption_event.is_set()):
                 self.is_ai_speaking = False
 
@@ -399,7 +371,13 @@ class CustomVoiceAgent:
                 except asyncio.QueueEmpty:
                     break
         self.is_ai_speaking = False
+        self.interruption_event.clear()
         try:
             await self.client_ws.send_json({"control": "clear_speaker_buffer"})
         except Exception:
             pass
+        if self._dg_tts_ws is not None:
+            try:
+                await self._dg_tts_ws.send(json.dumps({"type": "Clear"}))
+            except Exception:
+                pass
