@@ -6,7 +6,7 @@ import time
 import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed
-from difflib import SequenceMatcher
+from starlette.websockets import WebSocketDisconnect
 
 logger = logging.getLogger("voice_agent")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s", datefmt="%H:%M:%S")
@@ -19,15 +19,10 @@ if not DEEPGRAM_API_KEY or not GEMINI_API_KEY:
         "DEEPGRAM_API_KEY and GEMINI_API_KEY must be set in the environment (.env)"
     )
 
-# DEEPGRAM_STT_URL = (
-#     "wss://api.deepgram.com/v1/listen"
-#     "?model=nova-2&encoding=linear16&sample_rate=16000&channels=1"
-#     "&interim_results=true&endpointing=300&smart_format=true"
-# )
 DEEPGRAM_STT_URL = (
     "wss://api.deepgram.com/v1/listen"
     "?model=nova-2&encoding=linear16&sample_rate=16000&channels=1"
-    "&interim_results=true&endpointing=300&smart_format=true"
+    "&interim_results=true&endpointing=600&smart_format=true"
     "&vad_events=true"
 )
 DEEPGRAM_TTS_URL = (
@@ -48,9 +43,6 @@ SYSTEM_PROMPT = (
     "conversational since they will be spoken aloud."
 )
 
-BARGE_IN_RMS_RATIO = 0.02
-MAX_AMP=32768.0
-
 async def _connect_deepgram(url: str):
     """Connect to a Deepgram websocket, tolerating both old and new
     versions of the `websockets` library (the auth-header kwarg was
@@ -66,22 +58,16 @@ class CustomVoiceAgent:
     def __init__(self, client_websocket):
         self.client_ws = client_websocket
 
-        # Bounded queue bridges. Bounded so a stalled consumer applies
-        # backpressure instead of letting memory grow without limit.
         self.audio_in_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
-        # Audio threshold: chunks with RMS below this percentage of max
-        # amplitude are ignored (filters noise/echo/breath). Default 2%.
-        self.audio_threshold_ratio = 0.001
         self.llm_prompt_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
         self.tts_text_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self.audio_out_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
 
-        # Core state
         self.transcript_accumulator = ""
         self.sentence_buffer = ""
         self.is_ai_speaking = False
         self.interruption_event = asyncio.Event()
-        self.conversation_history = []  # list of {"role", "parts"}
+        self.conversation_history = []  
 
         self._tasks: list[asyncio.Task] = []
         self._dg_stt_ws = None
@@ -106,10 +92,6 @@ class CustomVoiceAgent:
             asyncio.create_task(self.write_client_speaker_loop(), name="speaker_out"),
         ]
         try:
-            # Only shut down when an actual exception kills a loop.
-            # Normal exits (e.g., Deepgram websocket close) must not
-            # kill the whole agent — that was the "stops after barge-in"
-            # root cause.
             done, pending = await asyncio.wait(
                 self._tasks, return_when=asyncio.FIRST_EXCEPTION
             )
@@ -136,9 +118,12 @@ class CustomVoiceAgent:
 # adds audio to the audio_in_queue
     async def read_client_mic_loop(self):
         """Task 1: intercepts raw binary audio chunks from the client."""
-        while True:
-            message = await self.client_ws.receive_bytes()
-            await self.audio_in_queue.put(message)
+        try:
+            while True:
+                message = await self.client_ws.receive_bytes()
+                await self.audio_in_queue.put(message)
+        except WebSocketDisconnect:
+            logger.info("Client disconnected (mic loop).")                
 
 # sends audio to deepgram and receives text via websocket
     async def deepgram_stt_loop(self):
@@ -190,6 +175,10 @@ class CustomVoiceAgent:
                             logger.info("STT time (last audio to speech_final): %.3fs", time.monotonic() - self._last_audio_sent_ts)
                         self._speech_final_ts = time.monotonic()
                         logger.info("User: %s", final_text)
+                        try:
+                            await self.client_ws.send_json({"transcript": {"role": "user", "text": final_text}})
+                        except Exception:
+                            pass
                         self.transcript_accumulator = ""
                         await self.llm_prompt_queue.put(final_text)
 
@@ -204,20 +193,8 @@ class CustomVoiceAgent:
         as soon as it is ready to speak."""
         async with httpx.AsyncClient(timeout=30.0) as client:
             while True:
-                try:
-                    prompt = await asyncio.wait_for(
-                        self.llm_prompt_queue.get(), timeout=3.0
-                    )
-                except asyncio.TimeoutError:
-                    # False interruption: no new user input arrived.
-                    # Auto-clear so pipeline doesn't deadlock.
-                    if self.interruption_event.is_set():
-                        logger.info("No new turn after interruption; clearing event.")
-                        self.interruption_event.clear()
-                        self.is_ai_speaking = False
-                        continue
-                    else:
-                        continue
+               
+                prompt = await self.llm_prompt_queue.get()
                
                 if self._speech_final_ts:
                     logger.info("Time from speech end to Gemini dispatch: %.3fs", time.monotonic() - self._speech_final_ts)
@@ -261,7 +238,6 @@ class CustomVoiceAgent:
 
                             full_reply += text_token
                             if not first_token_logged:
-                                self.interruption_event.clear()
                                 logger.info("Gemini time to first token: %.3fs", time.monotonic() - self._gemini_request_ts)
                                 first_token_logged = True
                             await self._buffer_and_dispatch(text_token)
@@ -288,6 +264,10 @@ class CustomVoiceAgent:
                     self.conversation_history.append(
                         {"role": "model", "parts": [{"text": full_reply}]}
                     )
+                    try:
+                        await self.client_ws.send_json({"transcript": {"role": "assistant", "text": full_reply}})
+                    except Exception:
+                        pass
                 self.llm_prompt_queue.task_done()
 
     async def _buffer_and_dispatch(self, token: str):
@@ -329,7 +309,6 @@ class CustomVoiceAgent:
             while True:
                 msg = await tts_ws.recv()
                 if isinstance(msg, bytes) and not self.interruption_event.is_set():
-                    # logger.info("Received %d bytes of audio from Deepgram TTS.", len(msg))
                     if self._tts_first_send_ts is not None:
                         logger.info("TTS time to first audio: %.3fs", time.monotonic() - self._tts_first_send_ts)
                         self._tts_first_send_ts = None
@@ -348,7 +327,11 @@ class CustomVoiceAgent:
             self._last_audio_out_ts = time.monotonic()
             if not self.interruption_event.is_set():
                 self.is_ai_speaking = True
-                await self.client_ws.send_bytes(audio_payload)
+                try:
+                    await self.client_ws.send_bytes(audio_payload)
+                except WebSocketDisconnect:
+                    logger.info("Client disconnected (speaker loop).")
+                    return
             self.audio_out_queue.task_done()
             # Only drop the flag once both pipelines are really quiet.
             # Use near-zero decay so False barge-in from finished AI

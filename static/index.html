@@ -8,6 +8,8 @@
     <h1>Live Voice Agent Engine</h1>
     <button id="startBtn" style="padding:15px 30px; font-size:18px; cursor:pointer;">Start Connection</button>
     <p id="status">Status: Disconnected</p>
+    <button id="stopBtn" style="padding:10px 20px; font-size:16px; cursor:pointer; display:none;">Stop Conversation</button>
+<div id="transcript" style="max-width:600px; margin:30px auto; text-align:left; max-height:60vh; overflow-y:auto;"></div>
 
     <script>
         const TARGET_SAMPLE_RATE = 16000;
@@ -64,6 +66,8 @@
 
             ws.onopen = async () => {
                 document.getElementById('status').innerText = "Status: Connected. Start talking!";
+                document.getElementById('startBtn').style.display = 'none';
+document.getElementById('stopBtn').style.display = 'inline-block';
                 await bindMicrophoneStream();
             };
 
@@ -88,6 +92,14 @@
                             try { src.stop(); } catch (e) {}
                         });
                         activeSources = [];
+                    }
+                    if (signal.transcript) {
+                        const div = document.createElement('div');
+                        div.style.margin = '8px 0';
+                        div.style.fontWeight = signal.transcript.role === 'user' ? 'bold' : 'normal';
+                        div.textContent = (signal.transcript.role === 'user' ? 'You: ' : 'AI: ') + signal.transcript.text;
+                        document.getElementById('transcript').appendChild(div);
+                        document.getElementById('transcript').scrollTop = document.getElementById('transcript').scrollHeight;
                     }
                     return;
                 }
@@ -149,6 +161,16 @@ console.log("Track settings:", audioTrack.getSettings());
             // Intentionally not connected to destination: this node only
             // captures and forwards audio, it should not be audible.
         }
+
+        document.getElementById('stopBtn').addEventListener('click', () => {
+    if (ws) ws.close();
+    if (audioCtx) audioCtx.close();
+    activeSources.forEach(src => { try { src.stop(); } catch (e) {} });
+    activeSources = [];
+    document.getElementById('startBtn').style.display = 'inline-block';
+    document.getElementById('stopBtn').style.display = 'none';
+    document.getElementById('status').innerText = "Status: Stopped.";
+});
     </script>
 </body>
 </html>
