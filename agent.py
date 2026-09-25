@@ -3,10 +3,13 @@ import json
 import logging
 import os
 import time
+from typing import AsyncIterator, cast
 import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed
 from starlette.websockets import WebSocketDisconnect
+from litellm import acompletion, exceptions
+from utils.strip_markdown import strip_markdown_for_speech
 
 logger = logging.getLogger("voice_agent")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s", datefmt="%H:%M:%S")
@@ -23,8 +26,9 @@ DEEPGRAM_STT_URL = (
     "wss://api.deepgram.com/v1/listen"
     "?model=nova-2&encoding=linear16&sample_rate=16000&channels=1"
     "&interim_results=true&endpointing=600&smart_format=true"
-    "&vad_events=true"
+    "&vad_events=true&utterance_end_ms=1000"
 )
+
 DEEPGRAM_TTS_URL = (
     "wss://api.deepgram.com/v1/speak"
     "?encoding=linear16&sample_rate=16000&model=aura-asteria-en"
@@ -33,15 +37,22 @@ GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     f"gemini-2.5-flash:streamGenerateContent?alt=sse&key={GEMINI_API_KEY}"
 )
+LLM_MODEL = "gemini/gemini-2.5-flash"
 
 SENTENCE_BOUNDARY_CHARS = {".", "!", "?", "\n"}
 CLAUSE_BOUNDARY_CHARS = {",", ";", ":"}
 MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH = 200
 
+DEFAULT_MAX_SESSION_SECONDS = 30          
+DEFAULT_INACTIVITY_TIMEOUT_SECONDS = 30    
+DEFAULT_GOODBYE_WAIT_SECONDS = 10 
+
 SYSTEM_PROMPT = (
     "You are a helpful, concise voice assistant. Keep replies short and "
     "conversational since they will be spoken aloud."
 )
+
+BASE_SYSTEM_PROMPT = "Do not use markdown formatting (no asterisks, bullet points, headers, or bold/italic syntax). Your responses are converted to speech, so write in plain spoken sentences only."
 
 async def _connect_deepgram(url: str):
     """Connect to a Deepgram websocket, tolerating both old and new
@@ -55,7 +66,15 @@ async def _connect_deepgram(url: str):
 
 
 class CustomVoiceAgent:
-    def __init__(self, client_websocket):
+    def __init__(
+        self, 
+        client_websocket, 
+        system_prompt=SYSTEM_PROMPT, 
+        max_session_seconds: float = DEFAULT_MAX_SESSION_SECONDS,
+        inactivity_timeout_seconds: float = DEFAULT_INACTIVITY_TIMEOUT_SECONDS,
+        max_duration_message: str = "We've reached our time limit for this session, goodbye for now.",
+        inactivity_message: str = "I haven't heard from you in a bit, so I'll go ahead and close this session.",
+    ):
         self.client_ws = client_websocket
 
         self.audio_in_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
@@ -68,6 +87,7 @@ class CustomVoiceAgent:
         self.is_ai_speaking = False
         self.interruption_event = asyncio.Event()
         self.conversation_history = []  
+        self.system_prompt = system_prompt + BASE_SYSTEM_PROMPT
 
         self._tasks: list[asyncio.Task] = []
         self._dg_stt_ws = None
@@ -79,6 +99,14 @@ class CustomVoiceAgent:
         self._tts_first_send_ts = None
         self._last_audio_out_ts = None
 
+        self.max_session_seconds = max_session_seconds
+        self.inactivity_timeout_seconds = inactivity_timeout_seconds
+        self.max_duration_message = max_duration_message
+        self.inactivity_message = inactivity_message
+        self._last_activity_ts = time.monotonic()
+
+        self._closing = False
+
 
     async def run(self):
         """Orchestrates system loops and guarantees cleanup on exit,
@@ -87,13 +115,14 @@ class CustomVoiceAgent:
         self._tasks = [
             asyncio.create_task(self.read_client_mic_loop(), name="mic_in"),
             asyncio.create_task(self.deepgram_stt_loop(), name="stt"),
-            asyncio.create_task(self.gemini_llm_loop(), name="llm"),
+            asyncio.create_task(self.llm_loop(), name="llm"),
             asyncio.create_task(self.deepgram_tts_loop(), name="tts"),
             asyncio.create_task(self.write_client_speaker_loop(), name="speaker_out"),
+            asyncio.create_task(self.session_timer_loop(), name="session_timer")
         ]
         try:
             done, pending = await asyncio.wait(
-                self._tasks, return_when=asyncio.FIRST_EXCEPTION
+                self._tasks, return_when=asyncio.FIRST_COMPLETED
             )
             for task in done:
                 if task.exception():
@@ -113,6 +142,10 @@ class CustomVoiceAgent:
                     await ws.close()
                 except Exception:
                     pass
+        try:
+            await self.client_ws.close()
+        except Exception:
+            pass        
         logger.info("Session cleaned up.")
 
 # adds audio to the audio_in_queue
@@ -131,16 +164,33 @@ class CustomVoiceAgent:
         self._dg_stt_ws = await _connect_deepgram(DEEPGRAM_STT_URL)
         dg_ws = self._dg_stt_ws
         logger.info("Connected to Deepgram STT.")
-
-# get audio chunks from the audio_in_queue and forward to deepgram
+    
         async def forward_audio_to_dg():
             while True:
                 chunk = await self.audio_in_queue.get()
                 await dg_ws.send(chunk)
                 self._last_audio_sent_ts = time.monotonic()
                 self.audio_in_queue.task_done()
-
-
+    
+        async def dispatch_final_transcript(source: str):
+            if not self.transcript_accumulator.strip():
+                return
+            final_text = self.transcript_accumulator.strip()
+            self._last_activity_ts = time.monotonic()
+            if self._last_audio_sent_ts:
+                logger.info(
+                    "STT time (last audio to %s): %.3fs",
+                    source, time.monotonic() - self._last_audio_sent_ts
+                )
+            self._speech_final_ts = time.monotonic()
+            logger.info("User: %s", final_text)
+            try:
+                await self.client_ws.send_json({"transcript": {"role": "user", "text": final_text}})
+            except Exception:
+                pass
+            self.transcript_accumulator = ""
+            await self.llm_prompt_queue.put(final_text)
+    
         async def handle_dg_responses():
             while True:
                 try:
@@ -149,126 +199,137 @@ class CustomVoiceAgent:
                 except json.JSONDecodeError:
                     logger.warning("Non-JSON message from Deepgram, skipping.")
                     continue
-        
+    
                 msg_type = data.get("type")
-        
+    
+                if msg_type == "UtteranceEnd":
+                    logger.info("UtteranceEnd received.")
+                    await dispatch_final_transcript("UtteranceEnd")
+                    continue
+    
                 if msg_type == "Results":
                     alt = data.get("channel", {}).get("alternatives", [{}])[0]
                     transcript = alt.get("transcript", "")
-
+    
                     if transcript:
                         logger.info("Interim transcript fragment: %r (is_final=%s) (is_speech_final=%d)", transcript, data.get("is_final"), data.get("speech_final"))
-
-# looks for the first word the user speaks => clears transcript => purges pipeline => data.get("is_final") & data.get("speech_final") evaluates to false => next iteration of the loop starts
-                        if self.is_ai_speaking and not self.interruption_event.is_set():
+    
+                        if self.is_ai_speaking and not self.interruption_event.is_set() and not self._closing:
                             logger.info("Barge-in detected via transcript: %r", transcript)
                             self.interruption_event.set()
                             self.transcript_accumulator = ""
                             await self._purge_pipeline()
-
+    
                         if data.get("is_final"):
                             self.transcript_accumulator += f" {transcript}"
-
-                    if data.get("speech_final") and self.transcript_accumulator.strip():
-                        final_text = self.transcript_accumulator.strip()
-                        if self._last_audio_sent_ts:
-                            logger.info("STT time (last audio to speech_final): %.3fs", time.monotonic() - self._last_audio_sent_ts)
-                        self._speech_final_ts = time.monotonic()
-                        logger.info("User: %s", final_text)
-                        try:
-                            await self.client_ws.send_json({"transcript": {"role": "user", "text": final_text}})
-                        except Exception:
-                            pass
-                        self.transcript_accumulator = ""
-                        await self.llm_prompt_queue.put(final_text)
-
+    
+                    if data.get("speech_final"):
+                        await dispatch_final_transcript("speech_final")
+    
         try:
             await asyncio.gather(forward_audio_to_dg(), handle_dg_responses())
         except ConnectionClosed:
             logger.warning("Deepgram STT connection closed.")
 
-    async def gemini_llm_loop(self):
-        """Task 3: streams prompts to Gemini, splits the response into
+    async def llm_loop(self):
+        """Task 3: streams prompts to the LLM via LiteLLM, splits the response into
         sentence-sized chunks, and forwards each chunk to the TTS queue
         as soon as it is ready to speak."""
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            while True:
-               
-                prompt = await self.llm_prompt_queue.get()
-               
-                if self._speech_final_ts:
-                    logger.info("Time from speech end to Gemini dispatch: %.3fs", time.monotonic() - self._speech_final_ts)
-                self._gemini_request_ts = time.monotonic()
-                self._tts_first_send_ts = None 
-                logger.info("Sending prompt to Gemini: %r", prompt)
-                self.sentence_buffer = ""
+        while True:
+    
+            prompt = await self.llm_prompt_queue.get()
 
-                self.conversation_history.append(
-                    {"role": "user", "parts": [{"text": prompt}]}
-                )
-
-                payload = {
-                    "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-                    "contents": self.conversation_history,
-                }
-
-                full_reply = ""
-                first_token_logged = False
-                try:
-                    async with client.stream("POST", GEMINI_URL, json=payload) as response:
-                        logger.info("Gemini response status: %s", response.status_code)
-                        response.raise_for_status()
-                        async for line in response.aiter_lines():
-                            if self.interruption_event.is_set():
-                                break
-                            decoded = line.strip()
-                            if not decoded.startswith("data:"):
-                                continue
-                            data_str = decoded[len("data:"):].strip()
-                            if not data_str or data_str == "[DONE]":
-                                continue
-                            try:
-                                chunk = json.loads(data_str)
-                                text_token = (
-                                    chunk["candidates"][0]["content"]["parts"][0]["text"]
-                                )
-                            except (KeyError, IndexError, json.JSONDecodeError) as e:
-                                logger.warning("Unparseable Gemini chunk: %r (%s)", data_str, e)
-                                continue
-
-                            full_reply += text_token
-                            if not first_token_logged:
-                                logger.info("Gemini time to first token: %.3fs", time.monotonic() - self._gemini_request_ts)
-                                first_token_logged = True
-                            await self._buffer_and_dispatch(text_token)
-
-                        if not full_reply.strip():
-                            logger.warning(
-                                "Empty Gemini response for prompt %r (interrupted=%s)",
-                                prompt, self.interruption_event.is_set()
-                            )
-                        logger.info("Gemini total time to final token: %.3fs", time.monotonic() - self._gemini_request_ts)
-
-                            
-                except httpx.HTTPError:
-                    logger.exception("Gemini request failed.")
-
-                # Flush whatever is left in the buffer so the last clause
-                # still gets spoken, then tell Deepgram TTS to flush audio.
-                if self.sentence_buffer.strip() and not self.interruption_event.is_set():
-                    await self.tts_text_queue.put(self.sentence_buffer)
-                await self.tts_text_queue.put({"flush": True})
-                self.sentence_buffer = ""
-
-                if full_reply.strip() and not self.interruption_event.is_set():
-                    self.conversation_history.append(
-                        {"role": "model", "parts": [{"text": full_reply}]}
-                    )
-                    try:
-                        await self.client_ws.send_json({"transcript": {"role": "assistant", "text": full_reply}})
-                    except Exception:
-                        pass
+            if self._closing:
                 self.llm_prompt_queue.task_done()
+                continue
+    
+            if self._speech_final_ts:
+                logger.info("Time from speech end to LLM dispatch: %.3fs", time.monotonic() - self._speech_final_ts)
+            self._gemini_request_ts = time.monotonic()
+            self._tts_first_send_ts = None
+            logger.info("Sending prompt to LLM: %r", prompt)
+            self.sentence_buffer = ""
+    
+            self.conversation_history.append(
+                {"role": "user", "content": prompt}
+            )
+    
+            messages = [{"role": "system", "content": self.system_prompt}] + self.conversation_history
+    
+            full_reply = ""
+            first_token_logged = False
+            try:
+                response = await acompletion(
+                    model=LLM_MODEL,
+                    messages=messages,
+                    stream=True,
+                    timeout=30.0,
+                )
+    
+                async for chunk in response:
+                    if self.interruption_event.is_set():
+                        break
+    
+                    try:
+                        text_token = chunk.choices[0].delta.content
+                    except (AttributeError, IndexError):
+                        text_token = None
+    
+                    if not text_token:
+                        continue
+    
+                    full_reply += text_token
+                    if not first_token_logged:
+                        logger.info("LLM time to first token: %.3fs", time.monotonic() - self._gemini_request_ts)
+                        first_token_logged = True
+    
+                    await self._buffer_and_dispatch(text_token)
+    
+                if not full_reply.strip():
+                    logger.warning(
+                        "Empty LLM response for prompt %r (interrupted=%s)",
+                        prompt, self.interruption_event.is_set()
+                    )
+                logger.info("LLM total time to final token: %.3fs", time.monotonic() - self._gemini_request_ts)
+    
+            except exceptions.APIError:
+                logger.exception("LLM request failed.")
+            except Exception:
+                logger.exception("Unexpected error during LLM streaming.")
+    
+            # Flush whatever is left in the buffer so the last clause
+            # still gets spoken, then tell Deepgram TTS to flush audio.
+            if self.sentence_buffer.strip() and not self.interruption_event.is_set():
+                await self.tts_text_queue.put(strip_markdown_for_speech(self.sentence_buffer))
+            await self.tts_text_queue.put({"flush": True})
+            self.sentence_buffer = ""
+    
+            if full_reply.strip() and not self.interruption_event.is_set():
+                self.conversation_history.append(
+                    {"role": "assistant", "content": full_reply}
+                )
+                try:
+                    await self.client_ws.send_json({"transcript": {"role": "assistant", "text": full_reply}})
+                except Exception:
+                    pass
+    
+            self.llm_prompt_queue.task_done()
+
+    # async def _buffer_and_dispatch(self, token: str):
+    #     """Accumulates streamed tokens and releases them to TTS at
+    #     sentence or clause boundaries, so Deepgram Aura gets coherent
+    #     chunks of text instead of single tokens."""
+    #     self.sentence_buffer += token
+    #     last_char = token[-1] if token else ""
+
+    #     should_flush = (
+    #         last_char in SENTENCE_BOUNDARY_CHARS
+    #         or (last_char in CLAUSE_BOUNDARY_CHARS and len(self.sentence_buffer) > 40)
+    #         or len(self.sentence_buffer) > MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH
+    #     )
+    #     if should_flush:
+    #         await self.tts_text_queue.put(strip_markdown_for_speech(self.sentence_buffer))
+    #         self.sentence_buffer = ""
 
     async def _buffer_and_dispatch(self, token: str):
         """Accumulates streamed tokens and releases them to TTS at
@@ -276,15 +337,16 @@ class CustomVoiceAgent:
         chunks of text instead of single tokens."""
         self.sentence_buffer += token
         last_char = token[-1] if token else ""
-
+    
         should_flush = (
             last_char in SENTENCE_BOUNDARY_CHARS
             or (last_char in CLAUSE_BOUNDARY_CHARS and len(self.sentence_buffer) > 40)
             or len(self.sentence_buffer) > MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH
         )
         if should_flush:
-            await self.tts_text_queue.put(self.sentence_buffer)
-            self.sentence_buffer = ""
+            await self.tts_text_queue.put(strip_markdown_for_speech(self.sentence_buffer))
+            await self.tts_text_queue.put({"flush": True})
+            self.sentence_buffer = ""        
 
     async def deepgram_tts_loop(self):
         """Task 4: submits buffered text to Deepgram's Aura streaming TTS
@@ -339,7 +401,45 @@ class CustomVoiceAgent:
             decay = (self._last_audio_out_ts is None or
                      (time.monotonic() - self._last_audio_out_ts) > 0.1)
             if (self.audio_out_queue.empty() and self.tts_text_queue.empty() and decay and not self.interruption_event.is_set()):
-                self.is_ai_speaking = False
+                self.is_ai_speaking = False   
+
+    async def session_timer_loop(self):
+        """Task 6: enforces a max session duration and an inactivity timeout,
+        closing the session with a spoken message when either is hit."""
+        session_start = time.monotonic()
+        while True:
+            await asyncio.sleep(1)
+    
+            now = time.monotonic()
+    
+            if now - session_start > self.max_session_seconds:
+                logger.info("Max session duration (%.0fs) reached, closing.", self.max_session_seconds)
+                await self._say_goodbye_and_close(self.max_duration_message)
+                return
+    
+            if now - self._last_activity_ts > self.inactivity_timeout_seconds:
+                logger.info("Inactivity timeout (%.0fs) reached, closing.", self.inactivity_timeout_seconds)
+                await self._say_goodbye_and_close(self.inactivity_message)
+                return
+
+    async def _say_goodbye_and_close(self, text: str):
+        """Halts any in-flight LLM/TTS output, then speaks a final message
+        through the pipeline and waits for it to finish playing."""
+        self._closing = True
+    
+        # Stop whatever is currently mid-stream and clear all queues/buffers
+        self.interruption_event.set()
+        await self._purge_pipeline()   # this also clears interruption_event at the end
+    
+        await self.tts_text_queue.put(strip_markdown_for_speech(text))
+        await self.tts_text_queue.put({"flush": True})
+    
+        deadline = time.monotonic() + DEFAULT_GOODBYE_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+            if self.tts_text_queue.empty() and self.audio_out_queue.empty() and not self.is_ai_speaking:
+                break
+        # client_ws is closed centrally in _shutdown(), after tasks are cancelled             
 
     async def _purge_pipeline(self):
         """Drains in-flight queues instantly during a user barge-in and
@@ -364,3 +464,4 @@ class CustomVoiceAgent:
                 await self._dg_tts_ws.send(json.dumps({"type": "Clear"}))
             except Exception:
                 pass
+       
