@@ -125,6 +125,9 @@ document.getElementById('stopBtn').style.display = 'inline-block';
                 activeSources.push(bufferSource);
                 bufferSource.onended = () => {
                     activeSources = activeSources.filter(s => s !== bufferSource);
+                    if (activeSources.length === 0) {
+                        ws.send(JSON.stringify({ control: "playback_complete" }));
+                    }
                 };
 
                 // Schedule chunks back-to-back to avoid gaps or crackling.
