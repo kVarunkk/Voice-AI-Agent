@@ -13,6 +13,7 @@
 
     <script>
         const TARGET_SAMPLE_RATE = 16000;
+        let utteranceEnded = false;
 
         // Runs on the audio rendering thread. Captures mic frames and
         // posts them to the main thread as Int16 PCM, replacing the
@@ -93,6 +94,13 @@ document.getElementById('stopBtn').style.display = 'inline-block';
                         });
                         activeSources = [];
                     }
+                    if (signal.control === "utterance_end") {
+    utteranceEnded = true;
+    if (activeSources.length === 0) {
+        ws.send(JSON.stringify({ control: "playback_complete" }));
+        utteranceEnded = false;
+    }
+}
                     if (signal.transcript) {
                         const div = document.createElement('div');
                         div.style.margin = '8px 0';
@@ -125,8 +133,9 @@ document.getElementById('stopBtn').style.display = 'inline-block';
                 activeSources.push(bufferSource);
                 bufferSource.onended = () => {
                     activeSources = activeSources.filter(s => s !== bufferSource);
-                    if (activeSources.length === 0) {
+                    if (activeSources.length === 0 && utteranceEnded) {
                         ws.send(JSON.stringify({ control: "playback_complete" }));
+                        utteranceEnded = false;
                     }
                 };
 
