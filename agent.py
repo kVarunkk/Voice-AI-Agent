@@ -19,8 +19,8 @@ from typing import cast
 from utils.guardrails import check_input, check_output
 from tools import TOOLS, TOOL_IMPLS
 import random
-from lib.constants import OTEL_EXPORTER_ENDPOINT, DEEPGRAM_API_KEY, GEMINI_API_KEY, SYSTEM_PROMPT, DEFAULT_MAX_SESSION_SECONDS, DEFAULT_INACTIVITY_TIMEOUT_SECONDS, DEFAULT_GREETING_MESSAGE, BASE_SYSTEM_PROMPT, DEEPGRAM_STT_URL, LLM_MODEL, SENTENCE_BOUNDARY_CHARS, CLAUSE_BOUNDARY_CHARS, MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH, DEEPGRAM_TTS_URL, GUARDRAIL_BLOCK_MESSAGE, DEFAULT_GOODBYE_WAIT_SECONDS, INACTIVITY_MESSAGE, MAX_DURATION_MESSAGE, MAX_TOOL_HOPS, TOOL_CALL_TIMEOUT_SECONDS, TOOL_FILLER_PHRASES
-
+from lib.constants import OTEL_EXPORTER_ENDPOINT, DEEPGRAM_API_KEY, GEMINI_API_KEY, SYSTEM_PROMPT, DEFAULT_MAX_SESSION_SECONDS, DEFAULT_INACTIVITY_TIMEOUT_SECONDS, DEFAULT_GREETING_MESSAGE, BASE_SYSTEM_PROMPT, DEEPGRAM_STT_URL, LLM_MODEL, SENTENCE_BOUNDARY_CHARS, CLAUSE_BOUNDARY_CHARS, MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH, DEEPGRAM_TTS_URL, GUARDRAIL_BLOCK_MESSAGE, DEFAULT_GOODBYE_WAIT_SECONDS, INACTIVITY_MESSAGE, MAX_DURATION_MESSAGE, MAX_TOOL_HOPS, TOOL_CALL_TIMEOUT_SECONDS, TOOL_FILLER_PHRASES, STABLE_INTERIM_SECS, STABLE_INTERIM_NO_PUNCT_SECS, FILLERS, DEFAULT_ENDPOINTING, DEFAULT_UTTERANCE_END
+import re
 
 resource = Resource.create({"service.name": "voice-agent"})
 provider = TracerProvider(resource=resource)
@@ -47,6 +47,12 @@ async def _connect_deepgram(url: str):
     except TypeError:
         return await websockets.connect(url, extra_headers=headers)
 
+def _words(s: str) -> list[str]:
+    return re.sub(r"[^\w\s']", "", s).lower().split()
+
+def _create_deepgram_stt_url(endpointing:int, utterance_end:int):
+    return DEEPGRAM_STT_URL.format(endpointing = endpointing, utterance_end = utterance_end)    
+
 
 class CustomVoiceAgent:
     def __init__(
@@ -57,7 +63,12 @@ class CustomVoiceAgent:
         inactivity_timeout_seconds: float = DEFAULT_INACTIVITY_TIMEOUT_SECONDS,
         max_duration_message: str = MAX_DURATION_MESSAGE,
         inactivity_message: str = INACTIVITY_MESSAGE,
-        greeting_message: str = DEFAULT_GREETING_MESSAGE
+        greeting_message: str = DEFAULT_GREETING_MESSAGE,
+        endpointing: int = DEFAULT_ENDPOINTING,
+        utterance_end: int = DEFAULT_UTTERANCE_END,
+        stable_interim_secs: float = STABLE_INTERIM_SECS,
+        stable_interim_secs_no_punct: float = STABLE_INTERIM_NO_PUNCT_SECS,
+        interview_id: str | None = None
     ):
         self.client_ws = client_websocket
 
@@ -65,6 +76,11 @@ class CustomVoiceAgent:
         self.llm_prompt_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
         self.tts_text_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self.audio_out_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+
+        self.endpointing = endpointing
+        self.utterance_end  = utterance_end
+        self.stable_interim_secs = stable_interim_secs
+        self.stable_interim_secs_no_punct = stable_interim_secs_no_punct
 
         self.transcript_accumulator = ""
         self.sentence_buffer = ""
@@ -75,6 +91,7 @@ class CustomVoiceAgent:
         self.turn_counter = 0
         self.system_prompt = system_prompt + BASE_SYSTEM_PROMPT
         self.greeting_message = greeting_message
+        self.interview_id = interview_id
 
         self._tasks: list[asyncio.Task] = []
         self._dg_stt_ws = None
@@ -101,6 +118,29 @@ class CustomVoiceAgent:
 
         self.is_welcome_message_running = False
         self._active_tool_task: list[asyncio.Task] | None = None
+
+
+        # in __init__
+        self._interim_text = ""
+        self._interim_since_ts = 0.0
+        self._stable_words = []
+        self._stable_dispatch_ts = 0.0
+
+        self._spoken_text_parts: list[str] = []
+
+
+    async def _emit_agent_chunk(self, text: str):
+        self._spoken_text_parts.append(text)
+        try:
+            await self.client_ws.send_json({
+                "transcript_chunk": {
+                    "role": "assistant",
+                    "turn_id": self.turn_counter + 1,
+                    "text": text,
+                }
+            })
+        except Exception:
+            pass    
 
 
     async def run(self):
@@ -189,9 +229,27 @@ class CustomVoiceAgent:
 # sends audio to deepgram and receives text via websocket
     async def deepgram_stt_loop(self):
         """Task 2: full-duplex pipe driving live Deepgram STT."""
-        self._dg_stt_ws = await _connect_deepgram(DEEPGRAM_STT_URL)
+        self._dg_stt_ws = await _connect_deepgram(_create_deepgram_stt_url(self.endpointing, self.utterance_end))
         dg_ws = self._dg_stt_ws
         logger.info("Connected to Deepgram STT.")
+
+        async def stable_interim_watcher():
+            while True:
+                await asyncio.sleep(0.05)
+                t = self._interim_text
+                if not t:
+                    continue
+                punct = t.rstrip().endswith((".", "?", "!"))
+                if not punct and len(_words(t)) < 3:
+                    continue  # fragment like "and"; wait for speech_final / UtteranceEnd
+                needed = self.stable_interim_secs if punct else self.stable_interim_secs_no_punct
+                if time.monotonic() - self._interim_since_ts >= needed:
+                    logger.info("Interim stable for >%.1fs, dispatching: %r", needed, t)
+                    self._stable_words = _words(t)
+                    self._stable_dispatch_ts = time.monotonic()
+                    self.transcript_accumulator += f" {t}"
+                    self._interim_text = ""
+                    await dispatch_final_transcript("stable_interim")
     
         async def forward_audio_to_dg():
             while True:
@@ -214,7 +272,7 @@ class CustomVoiceAgent:
             self._speech_final_ts = time.monotonic()
             logger.info("User: %s", final_text)
             try:
-                await self.client_ws.send_json({"transcript": {"role": "user", "text": final_text}})
+                await self.client_ws.send_json({"transcript": {"role": "user", "text": final_text, "turn_id": self.turn_counter + 1}})
             except Exception:
                 pass
             self.transcript_accumulator = ""
@@ -239,6 +297,15 @@ class CustomVoiceAgent:
                 return
             
             await self.llm_prompt_queue.put(final_text)
+
+        def strip_dispatched(text: str) -> str:
+            """Drop the part of `text` that was already sent via the stable interim path."""
+            if not self._stable_words or time.monotonic() - self._stable_dispatch_ts > 5:
+                return text
+            n = len(self._stable_words)
+            if _words(text)[:n] == self._stable_words:
+                return " ".join(text.split()[n:])
+            return text    
     
         async def handle_dg_responses():
             while True:
@@ -253,7 +320,12 @@ class CustomVoiceAgent:
     
                 if msg_type == "UtteranceEnd":
                     logger.info("UtteranceEnd received.")
+                    if self._interim_text and time.monotonic() - self._interim_since_ts < self.stable_interim_secs_no_punct:
+                        # Deepgram still has an unfinalized interim; wait for its final
+                        continue
                     await dispatch_final_transcript("UtteranceEnd")
+                    self._stable_words = []
+                    self._interim_text = ""
                     continue
     
                 if msg_type == "Results":
@@ -261,11 +333,24 @@ class CustomVoiceAgent:
                     transcript = alt.get("transcript", "")
     
                     if transcript:
+                        try:
+                            await self.client_ws.send_json({
+                                "transcript_chunk": {
+                                    "role": "user",
+                                    "turn_id": self.turn_counter + 1,
+                                    "text": f"{self.transcript_accumulator} {self._interim_text}".strip(),
+                                    "replace": True,
+                                }
+                            })
+                        except Exception:
+                            pass
                         self._last_activity_ts = time.monotonic()
+                        tail = strip_dispatched(transcript)
+                        new_words = [w for w in _words(tail) if w not in FILLERS]
 
-                        logger.info("Interim transcript fragment: %r (is_final=%s) (is_speech_final=%d)", transcript, data.get("is_final"), data.get("speech_final"))
+                        logger.info("Interim transcript fragment: %r (is_final=%s) (speech_final=%s)", transcript, data.get("is_final"), data.get("speech_final"))
 
-                        if self.is_ai_speaking and not self.interruption_event.is_set() and not self._closing and not self.is_welcome_message_running:
+                        if self.is_ai_speaking and not self.interruption_event.is_set() and not self._closing and not self.is_welcome_message_running and new_words:
                             logger.info("Barge-in detected via transcript: %r", transcript)
                             if self._current_turn_span:
                                 self._current_turn_span.set_attribute("turn.interrupted_by_barge_in", True)
@@ -274,13 +359,19 @@ class CustomVoiceAgent:
                             await self._purge_pipeline()
     
                         if data.get("is_final"):
-                            self.transcript_accumulator += f" {transcript}"
+                            if tail.strip():
+                                self.transcript_accumulator += f" {tail}"
+                            self._interim_text = ""
+                        elif tail.strip() and tail != self._interim_text:
+                            self._interim_text = tail
+                            self._interim_since_ts = time.monotonic()
     
                     if data.get("speech_final"):
                         await dispatch_final_transcript("speech_final")
     
         try:
-            await asyncio.gather(forward_audio_to_dg(), handle_dg_responses())
+            # await asyncio.gather(forward_audio_to_dg(), handle_dg_responses())
+            await asyncio.gather(forward_audio_to_dg(), handle_dg_responses(), stable_interim_watcher())
         except ConnectionClosed:
             if self._current_turn_span:
                 self._current_turn_span.set_status(Status(StatusCode.ERROR))
@@ -305,6 +396,7 @@ class CustomVoiceAgent:
             self._tts_first_send_ts = None
             logger.info("Sending prompt to LLM: %r", prompt)
             self.sentence_buffer = ""
+            self._spoken_text_parts = []
             self._any_output_sent = False
     
             self.conversation_history.append(
@@ -314,53 +406,10 @@ class CustomVoiceAgent:
             messages = [{"role": "system", "content": self.system_prompt}] + self.conversation_history
     
             full_reply = ""
-            first_token_logged = False
 
             with trace.use_span(self._current_turn_span, end_on_exit=False) if self._current_turn_span else contextlib.nullcontext():
                 with tracer.start_as_current_span("llm_stream", attributes={"llm.model": LLM_MODEL}) as llm_span:
                     try:
-                        # response = cast(CustomStreamWrapper, await acompletion(
-                        #     model=LLM_MODEL,
-                        #     messages=messages,
-                        #     stream=True,
-                        #     timeout=30.0,
-                        # ))
-            
-                        # async for chunk in response:
-                        #     if self.interruption_event.is_set():
-                        #         self.conversation_history.append(
-                        #             {"role": "assistant", "content": "No response."}
-                        #         )
-                        #         self.turn_counter += 1
-                        #         try:
-                        #             await self.client_ws.send_json({
-                        #                 "turn": {
-                        #                     "turn_id": self.turn_counter,
-                        #                     "timestamp": time.time(),
-                        #                     "user": prompt,
-                        #                     "assistant": full_reply if full_reply.strip() else None,
-                        #                     "interrupted": True,
-                        #                 }
-                        #             })
-                        #         except Exception:
-                        #             pass
-                        #         break
-            
-                        #     try:
-                        #         text_token = chunk.choices[0].delta.content
-                        #     except (AttributeError, IndexError):
-                        #         text_token = None
-            
-                        #     if not text_token:
-                        #         continue
-            
-                        #     full_reply += text_token
-                        #     if not first_token_logged:
-                        #         logger.info("LLM time to first token: %.3fs", time.monotonic() - self._gemini_request_ts)
-                        #         first_token_logged = True
-            
-                        #     await self._buffer_and_dispatch(text_token)
-
                         current_messages = messages
                         hop = 0
                         while hop < MAX_TOOL_HOPS:
@@ -368,6 +417,7 @@ class CustomVoiceAgent:
                             full_reply += reply_part
 
                             if self.interruption_event.is_set():
+                                spoken = " ".join(self._spoken_text_parts).strip()
                                 self.conversation_history.append({"role": "assistant", "content": "No response."})
                                 self.turn_counter += 1
                                 try:
@@ -414,6 +464,7 @@ class CustomVoiceAgent:
                         self._current_turn_span.set_attribute("guardrail.output_allowed", result.allowed)
                     if result.allowed:
                         await self.tts_text_queue.put(final_chunk)
+                        await self._emit_agent_chunk(final_chunk)
                     else:
                         logger.info("Output guardrail blocked final chunk: %s", result.reason)
 
@@ -424,11 +475,12 @@ class CustomVoiceAgent:
             self.sentence_buffer = ""
     
             if full_reply.strip() and not self.interruption_event.is_set():
+                spoken = " ".join(self._spoken_text_parts).strip() or full_reply   # add
                 self.conversation_history.append(
                     {"role": "assistant", "content": full_reply}
                 )
                 try:
-                    await self.client_ws.send_json({"transcript": {"role": "assistant", "text": full_reply}})
+                    await self.client_ws.send_json({"transcript": {"role": "assistant", "text": spoken, "turn_id": self.turn_counter + 1}})
                 except Exception:
                     pass
                 self.turn_counter += 1
@@ -438,7 +490,7 @@ class CustomVoiceAgent:
                             "turn_id": self.turn_counter,
                             "timestamp": time.time(),
                             "user": prompt,
-                            "assistant": full_reply,
+                            "assistant": spoken,
                             "interrupted": False,
                         }
                     })
@@ -470,6 +522,7 @@ class CustomVoiceAgent:
                     await self.tts_text_queue.put(text_to_send)
                     await self.tts_text_queue.put({"flush": True})
                     self._any_output_sent = True
+                    await self._emit_agent_chunk(text_to_send)
                 else:
                     logger.info("Output guardrail blocked chunk: %s", result.reason)
             self.sentence_buffer = remainder
@@ -484,6 +537,7 @@ class CustomVoiceAgent:
                     await self.tts_text_queue.put(text_to_send)
                     await self.tts_text_queue.put({"flush": True})
                     self._any_output_sent = True
+                    await self._emit_agent_chunk(text_to_send)
                 else:
                     logger.info("Output guardrail blocked chunk: %s", result.reason)
             self.sentence_buffer = ""
@@ -690,7 +744,7 @@ class CustomVoiceAgent:
 
         response = cast(CustomStreamWrapper, await acompletion(
             model=LLM_MODEL, messages=messages, stream=True, timeout=30.0,
-            tools=TOOLS, tool_choice="auto",
+            # tools=TOOLS, tool_choice="auto",
         ))
 
         async for chunk in response:
@@ -762,39 +816,29 @@ class CustomVoiceAgent:
         ]
         self._active_tool_task = tool_tasks  # now a list, shared cancellation handle
 
+        tools_group = asyncio.gather(*tool_tasks, return_exceptions=True)
         interrupt_wait_task = asyncio.create_task(self.interruption_event.wait())
 
         done, pending = await asyncio.wait(
-            [*tool_tasks, interrupt_wait_task],
+            [tools_group, interrupt_wait_task],
             timeout=TOOL_CALL_TIMEOUT_SECONDS,
-            return_when=asyncio.ALL_COMPLETED if False else asyncio.FIRST_COMPLETED,
+            return_when=asyncio.FIRST_COMPLETED,
         )
-
-        if interrupt_wait_task in done:
-            for t in tool_tasks:
-                if not t.done():
-                    t.cancel()
-            interrupt_wait_task.cancel()
-            self._active_tool_task = None
-            return False
 
         interrupt_wait_task.cancel()
 
-        remaining = [t for t in tool_tasks if not t.done()]
-        if remaining:
-            done2, pending2 = await asyncio.wait(remaining, timeout=TOOL_CALL_TIMEOUT_SECONDS)
-            if pending2:
-                for t in pending2:
+        if interrupt_wait_task in done or tools_group not in done:
+            # interrupted, or timed out
+            for t in tool_tasks:
+                if not t.done():
                     t.cancel()
-                for t in tool_tasks:
-                    if not t.done():
-                        continue
-                self._active_tool_task = None
+            self._active_tool_task = None
+            if interrupt_wait_task not in done:
                 await self.tts_text_queue.put(
                     strip_markdown_for_speech("That's taking longer than expected, let me get back to you.")
                 )
                 await self.tts_text_queue.put({"flush": True})
-                return False
+            return False
 
         self._active_tool_task = None
 

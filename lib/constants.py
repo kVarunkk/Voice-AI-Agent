@@ -6,8 +6,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEEPGRAM_STT_URL = (
     "wss://api.deepgram.com/v1/listen"
     "?model=nova-2&encoding=linear16&sample_rate=16000&channels=1"
-    "&interim_results=true&endpointing=300&smart_format=true"
+    "&interim_results=true&endpointing={endpointing}&smart_format=true"
     "&no_delay=true"
+    "&vad_events=true"
+    "&utterance_end_ms={utterance_end}"
 )
 
 DEEPGRAM_TTS_URL = (
@@ -43,3 +45,10 @@ TOOL_FILLER_PHRASES = [
 ]
 TOOL_CALL_TIMEOUT_SECONDS = 8.0
 MAX_TOOL_HOPS = 3
+
+DEFAULT_ENDPOINTING = 1200
+DEFAULT_UTTERANCE_END = 2500
+STABLE_INTERIM_SECS = 1.5
+STABLE_INTERIM_NO_PUNCT_SECS = 3.0
+
+FILLERS = {"and", "uh", "um", "so", "but", "or", "the", "a", "like"}
