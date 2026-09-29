@@ -1,3 +1,7 @@
 venv
 __pycache__
 .env
+plan
+dist
+myvoiceai.egg-info
+test_pypi_env

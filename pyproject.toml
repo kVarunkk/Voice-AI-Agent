@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "myvoiceai"
+version = "0.0.2"
+description = "Voice AI agent – real-time WebSocket voice session pipeline"
+readme = "README.md"
+license = "MIT"
+authors = [{name = "Your Name"}]
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.23",
+    "websockets>=12.0",
+    "httpx>=0.24",
+    "python-dotenv>=1.0",
+    "litellm>=0.13",
+]
+
+[project.optional-dependencies]
+observability = [
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp>=1.20",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourorg/myvoiceai"
+Repository = "https://github.com/yourorg/myvoiceai"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["myvoiceai*"]

@@ -1,47 +1,52 @@
 import asyncio
 import json
 import logging
-import os
 import time
 import websockets
 from websockets.exceptions import ConnectionClosed
 from starlette.websockets import WebSocketDisconnect
 from litellm import acompletion, exceptions, CustomStreamWrapper
-from utils.strip_markdown import strip_markdown_for_speech
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.trace import Status, StatusCode
-import contextlib
-from typing import cast
-from utils.guardrails import check_input, check_output
-from tools import TOOLS, TOOL_IMPLS
+from myvoiceai.utils.strip_markdown import strip_markdown_for_speech
+from myvoiceai.utils.guardrails import check_input, check_output
+from myvoiceai.tools import get_default_registry, ToolRegistry
 import random
-from lib.constants import OTEL_EXPORTER_ENDPOINT, DEEPGRAM_API_KEY, GEMINI_API_KEY, SYSTEM_PROMPT, DEFAULT_MAX_SESSION_SECONDS, DEFAULT_INACTIVITY_TIMEOUT_SECONDS, DEFAULT_GREETING_MESSAGE, BASE_SYSTEM_PROMPT, DEEPGRAM_STT_URL, LLM_MODEL, SENTENCE_BOUNDARY_CHARS, CLAUSE_BOUNDARY_CHARS, MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH, DEEPGRAM_TTS_URL, GUARDRAIL_BLOCK_MESSAGE, DEFAULT_GOODBYE_WAIT_SECONDS, INACTIVITY_MESSAGE, MAX_DURATION_MESSAGE, MAX_TOOL_HOPS, TOOL_CALL_TIMEOUT_SECONDS, TOOL_FILLER_PHRASES, STABLE_INTERIM_SECS, STABLE_INTERIM_NO_PUNCT_SECS, FILLERS, DEFAULT_ENDPOINTING, DEFAULT_UTTERANCE_END
+from myvoiceai.lib.constants import SYSTEM_PROMPT, DEFAULT_MAX_SESSION_SECONDS, DEFAULT_INACTIVITY_TIMEOUT_SECONDS, DEFAULT_GREETING_MESSAGE, BASE_SYSTEM_PROMPT, DEEPGRAM_STT_URL, LLM_MODEL, SENTENCE_BOUNDARY_CHARS, CLAUSE_BOUNDARY_CHARS, MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH, DEEPGRAM_TTS_URL, GUARDRAIL_BLOCK_MESSAGE, DEFAULT_GOODBYE_WAIT_SECONDS, INACTIVITY_MESSAGE, MAX_DURATION_MESSAGE, MAX_TOOL_HOPS, TOOL_CALL_TIMEOUT_SECONDS, TOOL_FILLER_PHRASES, STABLE_INTERIM_SECS, STABLE_INTERIM_NO_PUNCT_SECS, FILLERS, DEFAULT_ENDPOINTING, DEFAULT_UTTERANCE_END, DEEPGRAM_STT_MODEL, DEEPGRAM_TTS_MODEL
 import re
+from typing import cast
+import contextlib
 
-resource = Resource.create({"service.name": "voice-agent"})
-provider = TracerProvider(resource=resource)
-provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=OTEL_EXPORTER_ENDPOINT)))
-trace.set_tracer_provider(provider)
+try:
+    from myvoiceai.lib.constants import OTEL_EXPORTER_ENDPOINT
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.trace import StatusCode
 
-tracer = trace.get_tracer("voice_agent")
+    resource = Resource.create({"service.name": "voice-agent"})
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=OTEL_EXPORTER_ENDPOINT)))
+    trace.set_tracer_provider(provider)
+    tracer = trace.get_tracer("voice_agent")
+except Exception:
+    tracer = None
+    StatusCode = None  
+    # Dummy trace module so trace.use_span() works when OTEL is absent
+    class DummyTrace:
+        def use_span(self, span, end_on_exit=False):
+            import contextlib
+            return contextlib.nullcontext()
+    trace = DummyTrace()
 
 logger = logging.getLogger("voice_agent")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s", datefmt="%H:%M:%S")
+# logging.basicConfig(level=logging.INFO, format="%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s", datefmt="%H:%M:%S")
 
-if not DEEPGRAM_API_KEY or not GEMINI_API_KEY:
-    raise RuntimeError(
-        "DEEPGRAM_API_KEY and GEMINI_API_KEY must be set in the environment (.env)"
-    )
-
-async def _connect_deepgram(url: str):
+async def _connect_deepgram(url: str, api_key: str | None):
     """Connect to a Deepgram websocket, tolerating both old and new
     versions of the `websockets` library (the auth-header kwarg was
     renamed from extra_headers to additional_headers in v14)."""
-    headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+    headers = {"Authorization": f"Token {api_key}"}
     try:
         return await websockets.connect(url, additional_headers=headers)
     except TypeError:
@@ -50,27 +55,45 @@ async def _connect_deepgram(url: str):
 def _words(s: str) -> list[str]:
     return re.sub(r"[^\w\s']", "", s).lower().split()
 
-def _create_deepgram_stt_url(endpointing:int, utterance_end:int):
-    return DEEPGRAM_STT_URL.format(endpointing = endpointing, utterance_end = utterance_end)    
-
-
 class CustomVoiceAgent:
     def __init__(
         self, 
         client_websocket, 
-        system_prompt=SYSTEM_PROMPT, 
-        max_session_seconds: float = DEFAULT_MAX_SESSION_SECONDS,
-        inactivity_timeout_seconds: float = DEFAULT_INACTIVITY_TIMEOUT_SECONDS,
-        max_duration_message: str = MAX_DURATION_MESSAGE,
-        inactivity_message: str = INACTIVITY_MESSAGE,
-        greeting_message: str = DEFAULT_GREETING_MESSAGE,
-        endpointing: int = DEFAULT_ENDPOINTING,
-        utterance_end: int = DEFAULT_UTTERANCE_END,
-        stable_interim_secs: float = STABLE_INTERIM_SECS,
-        stable_interim_secs_no_punct: float = STABLE_INTERIM_NO_PUNCT_SECS,
-        interview_id: str | None = None
+        system_prompt: str, 
+        max_session_seconds: float,
+        inactivity_timeout_seconds: float,
+        max_duration_message: str,
+        inactivity_message: str,
+        greeting_message: str,
+        endpointing: int,
+        utterance_end: int,
+        stable_interim_secs: float,
+        stable_interim_secs_no_punct: float,
+        model: str,
+        stt_model: str,
+        tts_model: str,
+        tracing: bool,
+        session_id: str,
+        tool_registry: ToolRegistry,
+        llm_provider_api_key: str | None = None,
+        deepgram_api_key: str | None = None,
     ):
         self.client_ws = client_websocket
+        self.tracing = tracing
+        self.tracer = tracer if tracing else None
+        if tracing and self.tracer is None:
+            logger.warning("tracing=True but opentelemetry is not installed; tracing disabled. Install using pip install myvoiceai[observability]")
+        self.model = model
+        self.llm_provider_api_key = llm_provider_api_key
+        self.tool_registry = tool_registry 
+        self.session_id = session_id
+        self.deepgram_api_key = deepgram_api_key
+        self.stt_model = stt_model
+        self.tts_model = tts_model
+        if not self.deepgram_api_key:
+            raise RuntimeError(
+                "Pass the Deepgram API key."
+            )
 
         self.audio_in_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self.llm_prompt_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
@@ -91,7 +114,6 @@ class CustomVoiceAgent:
         self.turn_counter = 0
         self.system_prompt = system_prompt + BASE_SYSTEM_PROMPT
         self.greeting_message = greeting_message
-        self.interview_id = interview_id
 
         self._tasks: list[asyncio.Task] = []
         self._dg_stt_ws = None
@@ -128,21 +150,6 @@ class CustomVoiceAgent:
 
         self._spoken_text_parts: list[str] = []
 
-
-    async def _emit_agent_chunk(self, text: str):
-        self._spoken_text_parts.append(text)
-        try:
-            await self.client_ws.send_json({
-                "transcript_chunk": {
-                    "role": "assistant",
-                    "turn_id": self.turn_counter + 1,
-                    "text": text,
-                }
-            })
-        except Exception:
-            pass    
-
-
     async def run(self):
         """Orchestrates system loops and guarantees cleanup on exit,
         whether that exit is a client disconnect or an unhandled error
@@ -155,8 +162,8 @@ class CustomVoiceAgent:
             asyncio.create_task(self.write_client_speaker_loop(), name="speaker_out"),
             asyncio.create_task(self.session_timer_loop(), name="session_timer"),
         ]
-        await self._send_greeting()
         try:
+            await self._send_greeting()
             done, pending = await asyncio.wait(
                 self._tasks,
                 return_when=asyncio.FIRST_COMPLETED,
@@ -172,11 +179,12 @@ class CustomVoiceAgent:
             
             if self._closing:
                 await self._session_end_event.wait()
+        except Exception:
+            logger.exception("Voice session failed (session_id=%s)", self.session_id)        
         finally:
             await self._shutdown()
 
     async def _shutdown(self):
-
         if self._active_tool_task is not None:
             for t in self._active_tool_task:
                 if not t.done():
@@ -216,20 +224,21 @@ class CustomVoiceAgent:
                 elif "text" in message and message["text"] is not None:
                     try:
                         data = json.loads(message["text"])
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, ValueError):
                         continue
                     if data.get("control") == "playback_complete":
                         self._last_activity_ts = time.monotonic()
                         self.is_ai_speaking = False
                         if self.is_welcome_message_running:
                             self.is_welcome_message_running = False
-        except WebSocketDisconnect:
-            logger.info("Client disconnected (mic loop).")      
+        except (WebSocketDisconnect, RuntimeError) as e:
+            logger.info("Client connection ended (mic loop): %r", e)      
 
 # sends audio to deepgram and receives text via websocket
     async def deepgram_stt_loop(self):
         """Task 2: full-duplex pipe driving live Deepgram STT."""
-        self._dg_stt_ws = await _connect_deepgram(_create_deepgram_stt_url(self.endpointing, self.utterance_end))
+        self._dg_stt_ws = await _connect_deepgram(DEEPGRAM_STT_URL.format(stt_model=self.stt_model, endpointing = self.endpointing, utterance_end = self.utterance_end), self.deepgram_api_key)
+
         dg_ws = self._dg_stt_ws
         logger.info("Connected to Deepgram STT.")
 
@@ -277,22 +286,28 @@ class CustomVoiceAgent:
                 pass
             self.transcript_accumulator = ""
             turn_start_ns = self._last_audio_sent_wall_ts if self._last_audio_sent_wall_ts else time.time_ns()
-            self._current_turn_span = tracer.start_span(
-                "voice_turn",
-                attributes={"turn.user_text": final_text, "turn.id": self.turn_counter + 1},
-            )
+            if self.tracing and self.tracer:
+                self._current_turn_span = self.tracer.start_span(
+                    "voice_turn",
+                    attributes={"turn.user_text": final_text, "turn.id": self.turn_counter + 1, "session.id": self.session_id or ""},
+                )
+            else:
+                self._current_turn_span = None
             
-            with trace.use_span(self._current_turn_span, end_on_exit=False):
-                stt_span = tracer.start_span("stt_finalize", start_time=turn_start_ns)
-                stt_span.set_attribute("stt.source", source)
-                stt_span.end()
+            with trace.use_span(self._current_turn_span, end_on_exit=False) if self._current_turn_span else contextlib.nullcontext():
+                if self.tracing and self.tracer:
+                    stt_span = self.tracer.start_span("stt_finalize", start_time=turn_start_ns)
+                    stt_span.set_attribute("stt.source", source)
+                    stt_span.end()
 
             result = await check_input(final_text)
-            self._current_turn_span.set_attribute("guardrail.input_allowed", result.allowed)
+            if self._current_turn_span:
+                self._current_turn_span.set_attribute("guardrail.input_allowed", result.allowed)
             if not result.allowed:
-                self._current_turn_span.set_attribute("guardrail.input_reason", result.reason or "")
-                self._current_turn_span.end()
-                self._current_turn_span = None
+                if self._current_turn_span:
+                    self._current_turn_span.set_attribute("guardrail.input_reason", result.reason or "")
+                    self._current_turn_span.end()
+                    self._current_turn_span = None
                 await self._speak_guardrail_block()
                 return
             
@@ -373,8 +388,8 @@ class CustomVoiceAgent:
             # await asyncio.gather(forward_audio_to_dg(), handle_dg_responses())
             await asyncio.gather(forward_audio_to_dg(), handle_dg_responses(), stable_interim_watcher())
         except ConnectionClosed:
-            if self._current_turn_span:
-                self._current_turn_span.set_status(Status(StatusCode.ERROR))
+            if self._current_turn_span and StatusCode:
+                self._current_turn_span.set_status(StatusCode.ERROR)
                 self._current_turn_span.set_attribute("error.source", "deepgram_stt")
             logger.warning("Deepgram STT connection closed.")
 
@@ -407,53 +422,13 @@ class CustomVoiceAgent:
     
             full_reply = ""
 
-            with trace.use_span(self._current_turn_span, end_on_exit=False) if self._current_turn_span else contextlib.nullcontext():
-                with tracer.start_as_current_span("llm_stream", attributes={"llm.model": LLM_MODEL}) as llm_span:
-                    try:
-                        current_messages = messages
-                        hop = 0
-                        while hop < MAX_TOOL_HOPS:
-                            reply_part, tool_calls = await self._stream_completion(current_messages)
-                            full_reply += reply_part
-
-                            if self.interruption_event.is_set():
-                                spoken = " ".join(self._spoken_text_parts).strip()
-                                self.conversation_history.append({"role": "assistant", "content": "No response."})
-                                self.turn_counter += 1
-                                try:
-                                    await self.client_ws.send_json({
-                                        "turn": {
-                                            "turn_id": self.turn_counter, "timestamp": time.time(),
-                                            "user": prompt, "assistant": full_reply if full_reply.strip() else None,
-                                            "interrupted": True,
-                                        }
-                                    })
-                                except Exception:
-                                    pass
-                                break
-
-                            if not tool_calls:
-                                break
-
-                            ok = await self._execute_tool_hop(tool_calls)
-                            if not ok:
-                                break
-
-                            current_messages = [{"role": "system", "content": self.system_prompt}] + self.conversation_history
-                            hop += 1
-
-                        llm_span.set_attribute("llm.response_text", full_reply[:500])    
-            
-                        logger.info("LLM total time to final token: %.3fs", time.monotonic() - self._gemini_request_ts)
-            
-                    except exceptions.APIError:
-                        llm_span.record_exception(traceback_exc := __import__("sys").exc_info()[1])
-                        llm_span.set_status(Status(StatusCode.ERROR))
-                        logger.exception("LLM request failed.")
-                    except Exception:
-                        llm_span.record_exception(__import__("sys").exc_info()[1])
-                        llm_span.set_status(Status(StatusCode.ERROR))
-                        logger.exception("Unexpected error during LLM streaming.")
+            with (trace.use_span(self._current_turn_span, end_on_exit=False) if self._current_turn_span else contextlib.nullcontext()):
+                if self.tracing and self.tracer:
+                    with self.tracer.start_as_current_span("llm_stream", attributes={"llm.model": self.model}) as llm_span:
+                        full_reply = await self.llm_call(llm_span=llm_span, messages=messages, prompt=prompt)
+                else:
+                    full_reply = await self.llm_call(messages=messages, prompt=prompt)        
+                        
     
           
             if not self._closing:
@@ -541,12 +516,64 @@ class CustomVoiceAgent:
                 else:
                     logger.info("Output guardrail blocked chunk: %s", result.reason)
             self.sentence_buffer = ""
+
+
+    async def llm_call(self, messages, prompt, llm_span=None) -> str:
+        full_reply = ""
+        try:
+            current_messages = messages
+            hop = 0
+            while hop < MAX_TOOL_HOPS:
+                reply_part, tool_calls = await self._stream_completion(current_messages)
+                full_reply += reply_part
+
+                if self.interruption_event.is_set():
+                    self.conversation_history.append({"role": "assistant", "content": "No response."})
+                    self.turn_counter += 1
+                    try:
+                        await self.client_ws.send_json({
+                            "turn": {
+                                "turn_id": self.turn_counter, "timestamp": time.time(),
+                                "user": prompt, "assistant": full_reply if full_reply.strip() else None,
+                                "interrupted": True,
+                            }
+                        })
+                    except Exception:
+                        pass
+                    break
+
+                if not tool_calls:
+                    break
+
+                ok = await self._execute_tool_hop(tool_calls)
+                if not ok:
+                    break
+                current_messages = [{"role": "system", "content": self.system_prompt}] + self.conversation_history
+                hop += 1
+                
+            if llm_span:    
+                llm_span.set_attribute("llm.response_text", full_reply[:500])
+            logger.info("LLM total time to final token: %.3fs", time.monotonic() - (self._gemini_request_ts or 0))
+
+        except exceptions.APIError:
+            if llm_span:
+                llm_span.record_exception(traceback_exc := __import__("sys").exc_info()[1])
+            if StatusCode and llm_span:
+                llm_span.set_status(StatusCode.ERROR)
+            logger.exception("LLM request failed.")
+        except Exception:
+            if llm_span:
+                llm_span.record_exception(__import__("sys").exc_info()[1])
+            if StatusCode and llm_span:    
+                llm_span.set_status(StatusCode.ERROR)
+            logger.exception("Unexpected error during LLM streaming.")
+        return full_reply                             
        
 
     async def deepgram_tts_loop(self):
         """Task 4: submits buffered text to Deepgram's Aura streaming TTS
         and streams the resulting PCM audio back out."""
-        self._dg_tts_ws = await _connect_deepgram(DEEPGRAM_TTS_URL)
+        self._dg_tts_ws = await _connect_deepgram(DEEPGRAM_TTS_URL.format(tts_model=self.tts_model), self.deepgram_api_key)
         tts_ws = self._dg_tts_ws
 
         async def feed_text_to_tts():
@@ -561,8 +588,11 @@ class CustomVoiceAgent:
                         self._tts_first_send_ts = time.monotonic()
                         self._tts_span_start_ns = time.time_ns()
                     if self._current_turn_span:
-                        with trace.use_span(self._current_turn_span, end_on_exit=False):
-                            with tracer.start_as_current_span("tts_stream", attributes={"tts.text_len": len(item)}):
+                        with trace.use_span(self._current_turn_span, end_on_exit=False) if self.tracing and self.tracer else contextlib.nullcontext():
+                            if self.tracing and self.tracer:
+                                with self.tracer.start_as_current_span("tts_stream", attributes={"tts.text_len": len(item)}):
+                                    await tts_ws.send(json.dumps({"type": "Speak", "text": item}))
+                            else:
                                 await tts_ws.send(json.dumps({"type": "Speak", "text": item}))
                     else:
                         await tts_ws.send(json.dumps({"type": "Speak", "text": item}))    
@@ -577,9 +607,10 @@ class CustomVoiceAgent:
                     if self._tts_first_send_ts is not None:
                         logger.info("TTS time to first audio: %.3fs", time.monotonic() - self._tts_first_send_ts)
                         if self._current_turn_span and self._tts_span_start_ns:
-                            with trace.use_span(self._current_turn_span, end_on_exit=False):
-                                gen_span = tracer.start_span("tts_generation", start_time=self._tts_span_start_ns)
-                                gen_span.end()
+                            with trace.use_span(self._current_turn_span, end_on_exit=False) if self.tracing and self.tracer else contextlib.nullcontext():
+                                if self.tracing and self.tracer:
+                                    gen_span = self.tracer.start_span("tts_generation", start_time=self._tts_span_start_ns)
+                                    gen_span.end()
                         self._tts_first_send_ts = None
                         self._tts_span_start_ns = None
                     await self.audio_out_queue.put(msg)
@@ -614,6 +645,9 @@ class CustomVoiceAgent:
                     await self.client_ws.send_bytes(audio_payload)
                 except WebSocketDisconnect:
                     logger.info("Client disconnected (speaker loop).")
+                    return
+                except RuntimeError:
+                    logger.info("Client websocket not ready or closed (speaker loop).")
                     return
             self.audio_out_queue.task_done()
 
@@ -706,6 +740,19 @@ class CustomVoiceAgent:
             except Exception:
                 pass
 
+    async def _emit_agent_chunk(self, text: str):
+            self._spoken_text_parts.append(text)
+            try:
+                await self.client_ws.send_json({
+                    "transcript_chunk": {
+                        "role": "assistant",
+                        "turn_id": self.turn_counter + 1,
+                        "text": text,
+                    }
+                })
+            except Exception:
+                pass    
+
     async def _speak_guardrail_block(self):
         self.is_ai_speaking = True
         await self.tts_text_queue.put(strip_markdown_for_speech(GUARDRAIL_BLOCK_MESSAGE))
@@ -717,23 +764,32 @@ class CustomVoiceAgent:
         await self.tts_text_queue.put(strip_markdown_for_speech(self.greeting_message))
         await self.tts_text_queue.put({"flush": True})      
 
-    async def _run_tool_call(self, name: str, args: dict):
-        impl = TOOL_IMPLS.get(name)
+    async def _run_tool_call(self, name: str, args: dict) -> dict:
+        impl = self.tool_registry.lookup(name)
         if impl is None:
-            return {"error": f"unknown tool {name}"}
-        with trace.use_span(self._current_turn_span, end_on_exit=False) if self._current_turn_span else contextlib.nullcontext():
-            with tracer.start_as_current_span("tool_call", attributes={"tool.name": name, "tool.args": json.dumps(args)}) as span:
+            return {"error": f"unknown tool: {name}"}
+        if self.tracing and self.tracer:
+            with self.tracer.start_as_current_span("tool_call", attributes={"tool.name": name, "tool.args": json.dumps(args, default=str)}) as span:
                 try:
                     result = await impl(**args)
-                    span.set_attribute("tool.result", json.dumps(result)[:500])
+                    span.set_attribute("tool.result", json.dumps(result, default=str)[:500])
                     return result
                 except asyncio.CancelledError:
                     span.set_attribute("tool.cancelled", True)
                     raise
                 except Exception as e:
                     span.record_exception(e)
-                    span.set_status(Status(StatusCode.ERROR))
-                    return {"error": str(e)}   
+                    if StatusCode:
+                        span.set_status(StatusCode.ERROR)
+                    return {"error": str(e)}
+        else:
+            try:
+                result = await impl(**args)
+                return result
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                return {"error": str(e)}   
 
 
     async def _stream_completion(self, messages: list) -> tuple[str, dict[int, dict]]:
@@ -743,8 +799,13 @@ class CustomVoiceAgent:
         first_token_logged = False
 
         response = cast(CustomStreamWrapper, await acompletion(
-            model=LLM_MODEL, messages=messages, stream=True, timeout=30.0,
-            # tools=TOOLS, tool_choice="auto",
+            model=self.model,
+            messages=messages,
+            stream=True,
+            timeout=30.0,
+            api_key=self.llm_provider_api_key,
+            tools=self.tool_registry.schemas() or None,
+            # tool_choice="auto",
         ))
 
         async for chunk in response:
@@ -857,3 +918,61 @@ class CustomVoiceAgent:
             })
 
         return True      
+
+async def run_voice_session(
+    websocket,
+    *,
+    system_prompt=SYSTEM_PROMPT,
+    greeting_message=DEFAULT_GREETING_MESSAGE,
+    inactivity_message: str = INACTIVITY_MESSAGE,
+    max_duration_message: str = MAX_DURATION_MESSAGE,
+    max_session_seconds: float = DEFAULT_MAX_SESSION_SECONDS,
+    endpointing=DEFAULT_ENDPOINTING,
+    utterance_end=DEFAULT_UTTERANCE_END,
+    stable_interim_secs=STABLE_INTERIM_SECS,
+    stable_interim_secs_no_punct=STABLE_INTERIM_NO_PUNCT_SECS,
+    inactivity_timeout_seconds=DEFAULT_INACTIVITY_TIMEOUT_SECONDS,
+    model=LLM_MODEL,
+    llm_provider_api_key=None,
+    tracing=False,
+    session_id="New Session",
+    deepgram_api_key=None,
+    stt_model=DEEPGRAM_STT_MODEL,
+    tts_model=DEEPGRAM_TTS_MODEL,
+    tool_registry=get_default_registry(),
+    **kwargs
+):  
+    if kwargs:
+        logger.warning("run_voice_session: ignoring unsupported options: %s", ", ".join(sorted(kwargs)))  
+    try:
+        agent = CustomVoiceAgent(
+            client_websocket=websocket,
+            system_prompt=system_prompt,
+            greeting_message=greeting_message,
+            endpointing=endpointing,
+            utterance_end=utterance_end,
+            stable_interim_secs=stable_interim_secs,
+            stable_interim_secs_no_punct=stable_interim_secs_no_punct,
+            inactivity_timeout_seconds=inactivity_timeout_seconds,
+            session_id=session_id,
+            deepgram_api_key=deepgram_api_key,
+            model=model,
+            llm_provider_api_key=llm_provider_api_key,
+            tracing=tracing,
+            tool_registry=tool_registry,
+            stt_model=stt_model,
+            tts_model=tts_model,
+            max_session_seconds=max_session_seconds,
+            max_duration_message=max_duration_message,
+            inactivity_message=inactivity_message,
+            **kwargs,
+        )
+        await agent.run()
+    except asyncio.CancelledError:
+        raise    
+    except Exception:
+        logger.exception("Voice session failed for session_id=%s", session_id)
+        try:
+            await websocket.close(code=1011, reason="Session error")
+        except Exception:
+            pass

@@ -1,11 +1,13 @@
 import os
 
 OTEL_EXPORTER_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318/v1/traces")
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+# GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DEEPGRAM_STT_MODEL="nova-2"
+DEEPGRAM_TTS_MODEL="aura-asteria-en"
 DEEPGRAM_STT_URL = (
     "wss://api.deepgram.com/v1/listen"
-    "?model=nova-2&encoding=linear16&sample_rate=16000&channels=1"
+    "?model={stt_model}&encoding=linear16&sample_rate=16000&channels=1"
     "&interim_results=true&endpointing={endpointing}&smart_format=true"
     "&no_delay=true"
     "&vad_events=true"
@@ -14,7 +16,7 @@ DEEPGRAM_STT_URL = (
 
 DEEPGRAM_TTS_URL = (
     "wss://api.deepgram.com/v1/speak"
-    "?encoding=linear16&sample_rate=16000&model=aura-asteria-en"
+    "?encoding=linear16&sample_rate=16000&model={tts_model}"
 )
 LLM_MODEL = "gemini/gemini-2.5-flash"
 

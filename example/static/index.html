@@ -102,6 +102,7 @@ document.getElementById('stopBtn').style.display = 'inline-block';
     }
 }
                     if (signal.transcript) {
+                        print(signal.transcript)
                         const div = document.createElement('div');
                         div.style.margin = '8px 0';
                         div.style.fontWeight = signal.transcript.role === 'user' ? 'bold' : 'normal';
