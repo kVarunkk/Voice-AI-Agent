@@ -1,184 +1,541 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <title>Scratch Voice Agent</title>
 </head>
+
 <body style="background:#111; color:#fff; font-family:sans-serif; text-align:center; padding-top:10vh;">
     <h1>Live Voice Agent Engine</h1>
     <button id="startBtn" style="padding:15px 30px; font-size:18px; cursor:pointer;">Start Connection</button>
     <p id="status">Status: Disconnected</p>
-    <button id="stopBtn" style="padding:10px 20px; font-size:16px; cursor:pointer; display:none;">Stop Conversation</button>
-<div id="transcript" style="max-width:600px; margin:30px auto; text-align:left; max-height:60vh; overflow-y:auto;"></div>
+    <button id="stopBtn" style="padding:10px 20px; font-size:16px; cursor:pointer; display:none;">Stop
+        Conversation</button>
+    <div id="transcript" style="max-width:600px; margin:30px auto; text-align:left; max-height:60vh; overflow-y:auto;">
+    </div>
 
     <script>
         const TARGET_SAMPLE_RATE = 16000;
+
         let utteranceEnded = false;
 
-        // Runs on the audio rendering thread. Captures mic frames and
-        // posts them to the main thread as Int16 PCM, replacing the
-        // deprecated ScriptProcessorNode.
-        const workletSource = `
-            class MicCaptureProcessor extends AudioWorkletProcessor {
-                process(inputs) {
-                    const channel = inputs[0][0];
-                    if (channel && channel.length) {
-                        const pcm = new Int16Array(channel.length);
-                        for (let i = 0; i < channel.length; i++) {
-                            const s = Math.min(1, Math.max(-1, channel[i]));
-                            pcm[i] = s * 0x7FFF;
-                        }
-                        this.port.postMessage(pcm.buffer, [pcm.buffer]);
-                    }
-                    return true;
-                }
-            }
-            registerProcessor('mic-capture-processor', MicCaptureProcessor);
-        `;
-
         let ws;
-        let audioCtx;
+
+        let captureCtx;
+        let playbackCtx;
+
+        let micStream;
+        let micSource;
+        let micNode;
+
         let nextPlaybackTime = 0;
+        let playbackStarted = false;
         let activeSources = [];
 
-        document.getElementById('startBtn').addEventListener('click', async () => {
-            // audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: TARGET_SAMPLE_RATE });
-            console.log(audioCtx.sampleRate);
+        const PLAYBACK_BUFFER_SEC = 0.08;
 
-            // Browsers (Safari especially) may ignore a requested sample
-            // rate. Warn loudly instead of silently sending mislabeled
-            // audio to the server.
-            if (audioCtx.sampleRate !== TARGET_SAMPLE_RATE) {
-                console.warn(
-                    `AudioContext running at ${audioCtx.sampleRate}Hz, ` +
-                    `not the expected ${TARGET_SAMPLE_RATE}Hz. Resampling ` +
-                    `on the server or via an offline context is required ` +
-                    `for accurate transcription.`
-                );
+        const workletSource = `
+    class MicCaptureProcessor extends AudioWorkletProcessor {
+        process(inputs) {
+            const channel = inputs[0][0];
+
+            if (channel && channel.length) {
+                const pcm = new Int16Array(channel.length);
+
+                for (let i = 0; i < channel.length; i++) {
+                    const s = Math.min(1, Math.max(-1, channel[i]));
+                    pcm[i] = s < 0
+                        ? s * 0x8000
+                        : s * 0x7FFF;
+                }
+
+                this.port.postMessage(pcm.buffer, [pcm.buffer]);
             }
 
-            nextPlaybackTime = audioCtx.currentTime;
-
-            const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-            ws = new WebSocket(`${wsProtocol}://${window.location.host}/ws/voice`);
-            document.getElementById('status').innerText = "Status: Connecting...";
-            ws.binaryType = 'arraybuffer';
-
-            ws.onopen = async () => {
-                document.getElementById('status').innerText = "Status: Connected. Start talking!";
-                document.getElementById('startBtn').style.display = 'none';
-document.getElementById('stopBtn').style.display = 'inline-block';
-                await bindMicrophoneStream();
-            };
-
-            ws.onerror = () => {
-                document.getElementById('status').innerText = "Status: Connection error.";
-            };
-
-            ws.onclose = () => {
-                document.getElementById('status').innerText = "Status: Disconnected.";
-            };
-
-            ws.onmessage = async (event) => {
-                if (typeof event.data === 'string') {
-                    const signal = JSON.parse(event.data);
-                    if (signal.control === "clear_speaker_buffer") {
-                        nextPlaybackTime = audioCtx.currentTime;
-                        activeSources.forEach(src => {
-                            try { src.stop(); } catch (e) {}
-                        });
-                        activeSources = [];
-                    }
-                    if (signal.control === "utterance_end") {
-    utteranceEnded = true;
-    if (activeSources.length === 0) {
-        ws.send(JSON.stringify({ control: "playback_complete" }));
-        utteranceEnded = false;
+            return true;
+        }
     }
-}
-                    if (signal.transcript) {
-                        const div = document.createElement('div');
-                        div.style.margin = '8px 0';
-                        div.style.fontWeight = signal.transcript.role === 'user' ? 'bold' : 'normal';
-                        div.textContent = (signal.transcript.role === 'user' ? 'You: ' : 'AI: ') + signal.transcript.text;
-                        document.getElementById('transcript').appendChild(div);
-                        document.getElementById('transcript').scrollTop = document.getElementById('transcript').scrollHeight;
-                    }
-                    return;
+
+    registerProcessor(
+        'mic-capture-processor',
+        MicCaptureProcessor
+    );
+`;
+
+        document
+            .getElementById('startBtn')
+            .addEventListener('click', async () => {
+                try {
+                    /*
+                     * Separate contexts:
+                     *
+                     * 1. captureCtx = microphone/AEC/input
+                     * 2. playbackCtx = agent audio/output
+                     *
+                     * Firefox can behave differently when microphone
+                     * capture and Web Audio playback share the same
+                     * AudioContext.
+                     */
+                    captureCtx = new (
+                        window.AudioContext ||
+                        window.webkitAudioContext
+                    )({
+                        sampleRate: TARGET_SAMPLE_RATE
+                    });
+
+
+                    playbackCtx = new (
+                        window.AudioContext ||
+                        window.webkitAudioContext
+                    )(navigator.userAgent.includes('Firefox') ? {} : { sampleRate: TARGET_SAMPLE_RATE });
+
+                    await captureCtx.resume();
+                    await playbackCtx.resume();
+
+                    console.log(
+                        "Capture context sample rate:",
+                        captureCtx.sampleRate
+                    );
+
+                    console.log(
+                        "Playback context sample rate:",
+                        playbackCtx.sampleRate
+                    );
+
+                    nextPlaybackTime =
+                        playbackCtx.currentTime;
+
+                    const wsProtocol =
+                        window.location.protocol === 'https:'
+                            ? 'wss'
+                            : 'ws';
+
+                    ws = new WebSocket(
+                        `${wsProtocol}://${window.location.host}/ws/voice`
+                    );
+
+                    ws.binaryType = 'arraybuffer';
+
+                    document.getElementById(
+                        'status'
+                    ).innerText =
+                        "Status: Connecting...";
+
+                    ws.onopen = async () => {
+                        document.getElementById(
+                            'status'
+                        ).innerText =
+                            "Status: Connected. Start talking!";
+
+                        document.getElementById(
+                            'startBtn'
+                        ).style.display = 'none';
+
+                        document.getElementById(
+                            'stopBtn'
+                        ).style.display = 'inline-block';
+
+                        await bindMicrophoneStream();
+                    };
+
+                    ws.onerror = () => {
+                        document.getElementById(
+                            'status'
+                        ).innerText =
+                            "Status: Connection error.";
+                    };
+
+                    ws.onclose = () => {
+                        document.getElementById(
+                            'status'
+                        ).innerText =
+                            "Status: Disconnected.";
+                    };
+
+                    ws.onmessage = async (event) => {
+                        /*
+                         * Control / transcript messages.
+                         */
+                        if (
+                            typeof event.data === 'string'
+                        ) {
+                            const signal =
+                                JSON.parse(event.data);
+
+
+                            if (signal.control === "clear_speaker_buffer") {
+                                nextPlaybackTime =
+                                    playbackCtx.currentTime;
+
+                                playbackStarted = false;
+
+                                activeSources.forEach(src => {
+                                    try {
+                                        src.stop();
+                                    } catch (e) { }
+                                });
+
+                                activeSources = [];
+                            }
+
+                            if (
+                                signal.control ===
+                                "utterance_end"
+                            ) {
+                                utteranceEnded = true;
+
+                                if (
+                                    activeSources.length === 0
+                                ) {
+                                    if (
+                                        ws &&
+                                        ws.readyState ===
+                                        WebSocket.OPEN
+                                    ) {
+                                        ws.send(
+                                            JSON.stringify({
+                                                control:
+                                                    "playback_complete"
+                                            })
+                                        );
+                                    }
+
+                                    utteranceEnded = false;
+                                }
+                            }
+
+                            if (signal.transcript) {
+                                const div =
+                                    document.createElement(
+                                        'div'
+                                    );
+
+                                div.style.margin =
+                                    '8px 0';
+
+                                div.style.fontWeight =
+                                    signal.transcript.role ===
+                                        'user'
+                                        ? 'bold'
+                                        : 'normal';
+
+                                div.textContent =
+                                    (
+                                        signal.transcript
+                                            .role === 'user'
+                                            ? 'You: '
+                                            : 'AI: '
+                                    ) +
+                                    signal.transcript.text;
+
+                                const transcript =
+                                    document.getElementById(
+                                        'transcript'
+                                    );
+
+                                transcript.appendChild(div);
+
+                                transcript.scrollTop =
+                                    transcript.scrollHeight;
+                            }
+
+                            return;
+                        }
+
+                        /*
+                         * Server sends signed 16-bit PCM
+                         * at TARGET_SAMPLE_RATE.
+                         */
+                        const pcmData =
+                            new Int16Array(
+                                event.data
+                            );
+
+                        const float32Data =
+                            new Float32Array(
+                                pcmData.length
+                            );
+
+                        for (
+                            let i = 0;
+                            i < pcmData.length;
+                            i++
+                        ) {
+                            float32Data[i] =
+                                pcmData[i] / 32768.0;
+                        }
+
+                        const audioBuffer =
+                            playbackCtx.createBuffer(
+                                1,
+                                float32Data.length,
+                                TARGET_SAMPLE_RATE
+                            );
+
+                        audioBuffer
+                            .getChannelData(0)
+                            .set(float32Data);
+
+                        const bufferSource =
+                            playbackCtx.createBufferSource();
+
+                        bufferSource.buffer =
+                            audioBuffer;
+
+                        /*
+                         * Playback exists ONLY in playbackCtx.
+                         * It is never connected to captureCtx.
+                         */
+                        bufferSource.connect(
+                            playbackCtx.destination
+                        );
+
+                        activeSources.push(
+                            bufferSource
+                        );
+
+                        bufferSource.onended = () => {
+                            activeSources =
+                                activeSources.filter(
+                                    source =>
+                                        source !==
+                                        bufferSource
+                                );
+
+                            if (
+                                activeSources.length ===
+                                0 &&
+                                utteranceEnded
+                            ) {
+                                if (
+                                    ws &&
+                                    ws.readyState ===
+                                    WebSocket.OPEN
+                                ) {
+                                    ws.send(
+                                        JSON.stringify({
+                                            control:
+                                                "playback_complete"
+                                        })
+                                    );
+                                }
+
+                                utteranceEnded = false;
+                            }
+                        };
+
+                        if (
+                            nextPlaybackTime <
+                            playbackCtx.currentTime
+                        ) {
+                            nextPlaybackTime =
+                                playbackCtx.currentTime;
+                        }
+
+                        bufferSource.start(
+                            nextPlaybackTime
+                        );
+
+                        nextPlaybackTime +=
+                            audioBuffer.duration;
+
+
+                    };
+                } catch (error) {
+                    console.error(
+                        "Failed to start voice session:",
+                        error
+                    );
+
+                    document.getElementById(
+                        'status'
+                    ).innerText =
+                        "Status: Failed to start.";
                 }
-
-                // Play raw binary linear16 PCM buffers sequentially.
-                const pcmData = new Int16Array(event.data);
-                const float32Data = new Float32Array(pcmData.length);
-                for (let i = 0; i < pcmData.length; i++) {
-                    // Convert PCM Int16 to Float32 for the Web Audio API.
-                    float32Data[i] = pcmData[i] / 32768.0;
-                }
-
-                const audioBuffer = audioCtx.createBuffer(1, float32Data.length, TARGET_SAMPLE_RATE);
-                audioBuffer.getChannelData(0).set(float32Data);
-
-                // const bufferSource = audioCtx.createBufferSource();
-                // bufferSource.buffer = audioBuffer;
-                // bufferSource.connect(audioCtx.destination);
-
-                const bufferSource = audioCtx.createBufferSource();
-                bufferSource.buffer = audioBuffer;
-                bufferSource.connect(audioCtx.destination);
-                activeSources.push(bufferSource);
-                bufferSource.onended = () => {
-                    activeSources = activeSources.filter(s => s !== bufferSource);
-                    if (activeSources.length === 0 && utteranceEnded) {
-                        ws.send(JSON.stringify({ control: "playback_complete" }));
-                        utteranceEnded = false;
-                    }
-                };
-
-                // Schedule chunks back-to-back to avoid gaps or crackling.
-                if (nextPlaybackTime < audioCtx.currentTime) {
-                    nextPlaybackTime = audioCtx.currentTime;
-                }
-                bufferSource.start(nextPlaybackTime);
-                nextPlaybackTime += audioBuffer.duration;
-            };
-        });
+            });
 
         async function bindMicrophoneStream() {
-            const stream = await navigator.mediaDevices.getUserMedia({
-                audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
-            });
-            const audioTrack = stream.getAudioTracks()[0];
-console.log("Recording from device:", audioTrack.label);
-console.log("Track settings:", audioTrack.getSettings());
+            /*
+             * Explicit AEC configuration.
+             */
+            micStream =
+                await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        // autoGainControl: true
+                    }
+                });
 
-            const blob = new Blob([workletSource], { type: 'application/javascript' });
-            const workletUrl = URL.createObjectURL(blob);
-            await audioCtx.audioWorklet.addModule(workletUrl);
+            const audioTrack =
+                micStream.getAudioTracks()[0];
 
-            const source = audioCtx.createMediaStreamSource(stream);
-            const micNode = new AudioWorkletNode(audioCtx, 'mic-capture-processor');
+            console.log(
+                "Recording from device:",
+                audioTrack.label
+            );
 
-            micNode.port.onmessage = (event) => {
-                if (ws && ws.readyState === WebSocket.OPEN) {
+            console.log(
+                "Track settings:",
+                audioTrack.getSettings()
+            );
+
+            /*
+             * Re-apply the AEC constraints to the actual track.
+             */
+
+            console.log(
+                "Final track settings:",
+                audioTrack.getSettings()
+            );
+
+            /*
+             * Register microphone worklet.
+             */
+            const blob = new Blob(
+                [workletSource],
+                {
+                    type:
+                        'application/javascript'
+                }
+            );
+
+            const workletUrl =
+                URL.createObjectURL(blob);
+
+            await captureCtx.audioWorklet.addModule(
+                workletUrl
+            );
+
+            URL.revokeObjectURL(workletUrl);
+
+            /*
+             * Capture graph.
+             *
+             * IMPORTANT:
+             * Do NOT connect this graph to
+             * captureCtx.destination.
+             */
+            micSource =
+                captureCtx.createMediaStreamSource(
+                    micStream
+                );
+
+            micNode =
+                new AudioWorkletNode(
+                    captureCtx,
+                    'mic-capture-processor'
+                );
+
+            micNode.port.onmessage = (
+                event
+            ) => {
+                if (
+                    ws &&
+                    ws.readyState ===
+                    WebSocket.OPEN
+                ) {
                     ws.send(event.data);
                 }
             };
 
-            source.connect(micNode);
-            // Intentionally not connected to destination: this node only
-            // captures and forwards audio, it should not be audible.
+            micSource.connect(
+                micNode
+            );
+
+            console.log(
+                "Mic capture graph initialized."
+            );
         }
 
-        document.getElementById('stopBtn').addEventListener('click', () => {
-    if (ws) ws.close();
-    if (audioCtx) audioCtx.close();
-    activeSources.forEach(src => { try { src.stop(); } catch (e) {} });
-    activeSources = [];
-    document.getElementById('startBtn').style.display = 'inline-block';
-    document.getElementById('stopBtn').style.display = 'none';
-    document.getElementById('status').innerText = "Status: Stopped.";
-});
+        document
+            .getElementById('stopBtn')
+            .addEventListener('click', () => {
+                if (ws) {
+                    try {
+                        ws.close();
+                    } catch (e) { }
+
+                    ws = null;
+                }
+
+                if (micNode) {
+                    try {
+                        micNode.disconnect();
+                    } catch (e) { }
+
+                    micNode = null;
+                }
+
+                if (micSource) {
+                    try {
+                        micSource.disconnect();
+                    } catch (e) { }
+
+                    micSource = null;
+                }
+
+                if (micStream) {
+                    micStream
+                        .getTracks()
+                        .forEach(track => {
+                            try {
+                                track.stop();
+                            } catch (e) { }
+                        });
+
+                    micStream = null;
+                }
+
+                activeSources.forEach(
+                    src => {
+                        try {
+                            src.stop();
+                        } catch (e) { }
+                    }
+                );
+
+                activeSources = [];
+
+                if (captureCtx) {
+                    captureCtx
+                        .close()
+                        .catch(() => { });
+
+                    captureCtx = null;
+                }
+
+                if (playbackCtx) {
+                    playbackCtx
+                        .close()
+                        .catch(() => { });
+
+                    playbackCtx = null;
+                }
+
+                // utteranceEnded = false;
+                // nextPlaybackTime = 0;
+
+                utteranceEnded = false;
+                playbackStarted = false;
+                nextPlaybackTime = 0;
+
+                document.getElementById(
+                    'startBtn'
+                ).style.display = 'inline-block';
+
+                document.getElementById(
+                    'stopBtn'
+                ).style.display = 'none';
+
+                document.getElementById(
+                    'status'
+                ).innerText =
+                    "Status: Stopped.";
+            });
     </script>
 </body>
+
 </html>
