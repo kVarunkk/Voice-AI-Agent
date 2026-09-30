@@ -40,7 +40,6 @@ except Exception:
     trace = DummyTrace()
 
 logger = logging.getLogger("voice_agent")
-# logging.basicConfig(level=logging.INFO, format="%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s", datefmt="%H:%M:%S")
 
 async def _connect_deepgram(url: str, api_key: str | None):
     """Connect to a Deepgram websocket, tolerating both old and new
@@ -132,7 +131,7 @@ class CustomVoiceAgent:
         self._last_activity_ts = time.monotonic()
 
         self._closing = False
-        self._session_end_event = asyncio.Event()
+        # self._session_end_event = asyncio.Event()
         self._tts_flush_event = asyncio.Event()
         self._tts_span_start_ns = None
         self._last_audio_sent_wall_ts = None
@@ -177,8 +176,8 @@ class CustomVoiceAgent:
                         exc_info=task.exception(),
                     )
             
-            if self._closing:
-                await self._session_end_event.wait()
+            # if self._closing:
+            #     await self._session_end_event.wait()
         except Exception:
             logger.exception("Voice session failed (session_id=%s)", self.session_id)        
         finally:
@@ -209,7 +208,7 @@ class CustomVoiceAgent:
             pass        
         logger.info("Session cleaned up.")
 
-# adds audio to the audio_in_queue
+    # adds audio to the audio_in_queue
     async def read_client_mic_loop(self):
         """Task 1: intercepts raw binary audio chunks from the client,
         and dispatches JSON control/ack messages on the same channel."""
@@ -226,6 +225,7 @@ class CustomVoiceAgent:
                         data = json.loads(message["text"])
                     except (json.JSONDecodeError, ValueError):
                         continue
+                    # IMPORTANT: client has to send the playback_complete event
                     if data.get("control") == "playback_complete":
                         self._last_activity_ts = time.monotonic()
                         self.is_ai_speaking = False
@@ -234,7 +234,7 @@ class CustomVoiceAgent:
         except (WebSocketDisconnect, RuntimeError) as e:
             logger.info("Client connection ended (mic loop): %r", e)      
 
-# sends audio to deepgram and receives text via websocket
+    # sends audio to deepgram and receives text via websocket
     async def deepgram_stt_loop(self):
         """Task 2: full-duplex pipe driving live Deepgram STT."""
         self._dg_stt_ws = await _connect_deepgram(DEEPGRAM_STT_URL.format(stt_model=self.stt_model, endpointing = self.endpointing, utterance_end = self.utterance_end), self.deepgram_api_key)
@@ -385,7 +385,6 @@ class CustomVoiceAgent:
                         await dispatch_final_transcript("speech_final")
     
         try:
-            # await asyncio.gather(forward_audio_to_dg(), handle_dg_responses())
             await asyncio.gather(forward_audio_to_dg(), handle_dg_responses(), stable_interim_watcher())
         except ConnectionClosed:
             if self._current_turn_span and StatusCode:
@@ -701,7 +700,7 @@ class CustomVoiceAgent:
         except asyncio.TimeoutError:
             logger.warning("Timed out waiting for Deepgram goodbye audio.")
 
-        self._session_end_event.set()    
+        # self._session_end_event.set()    
     
 
     async def _purge_pipeline(self):

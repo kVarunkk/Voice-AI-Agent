@@ -28,15 +28,19 @@ await run_voice_session(
     system_prompt="You are a helpful assistant.",
     greeting_message="Hello! How can I help you today?",
     session_id="session-001",
-    model="gemini-2.5-flash",
+    model="gemini/gemini-2.5-flash",
     llm_provider_api_key="your-gemini-key",
     deepgram_api_key="your-deepgram-key",
+    stt_model="nova-2",
+    tts_model="aura-asteria-en",
     tracing=False,
     endpointing=1200,
     utterance_end=2500,
     stable_interim_secs=1.5,
     stable_interim_secs_no_punct=3.0,
     inactivity_timeout_seconds=30,
+    max_session_seconds=300,
+    tool_registry=None,
 )
 ```
 
@@ -84,7 +88,7 @@ await run_voice_session(
 Run the FastAPI example server (keys passed via `.env` in the example, but they can also be hardcoded or passed through config):
 
 ```bash
-uvicorn myvoiceai.example.fastapi_app:app --host 0.0.0.0 --port 8000
+uvicorn example.fastapi_app:app --host 0.0.0.0 --port 8000
 ```
 
 Connect WebSocket clients to `ws://localhost:8000/ws/voice`.
@@ -104,35 +108,39 @@ A `.env.example` is included for local convenience but is optional.
 ## API Reference
 
 ### `run_voice_session(websocket, ...)`
+
 Main entry point. Parameter reference:
 
-| Parameter | Use / Purpose |
-|---|---|
-| `websocket` | WebSocket connection from FastAPI / client |
-| `system_prompt` | LLM system instruction (default: concise voice assistant) |
-| `greeting_message` | First spoken message to user |
-| `session_id` | Session identifier for tracing/logs (replaces old `interview_id`) |
-| `model` | LLM model ID (e.g., `gemini/gemini-2.5-flash`) |
-| `llm_provider_api_key` | LLM provider API key (required) |
-| `deepgram_api_key` | Deepgram STT/TTS API key (required) |
-| `stt_model` | Deepgram STT model (default `nova-2`) |
-| `tts_model` | Deepgram TTS voice model (default `aura-asteria-en`) |
-| `tracing` | `True` only with `[observability]` installed; sends traces to OTLP |
-| `tool_registry` | `ToolRegistry` with custom `function` schemas |
-| `endpointing` | Pause duration (ms) after endpointing |
-| `utterance_end` | Stop recording (ms) when utterance ends |
-| `stable_interim_secs` | Stable interim result delay (secs) |
-| `stable_interim_secs_no_punct` | Same, when no punctuation detected |
-| `inactivity_timeout_seconds` | Close session after silence (default 10) |
-| `max_session_seconds` | Hard session time cap (`CustomVoiceAgent` only) |
+| Parameter                      | Use / Purpose                                                      |
+| ------------------------------ | ------------------------------------------------------------------ |
+| `websocket`                    | WebSocket connection from FastAPI / client                         |
+| `system_prompt`                | LLM system instruction (default: concise voice assistant)          |
+| `greeting_message`             | First spoken message to user                                       |
+| `session_id`                   | Session identifier for tracing/logs (replaces old `interview_id`)  |
+| `model`                        | LLM model ID (e.g., `gemini/gemini-2.5-flash`)                     |
+| `llm_provider_api_key`         | LLM provider API key (required)                                    |
+| `deepgram_api_key`             | Deepgram STT/TTS API key (required)                                |
+| `stt_model`                    | Deepgram STT model (default `nova-2`)                              |
+| `tts_model`                    | Deepgram TTS voice model (default `aura-asteria-en`)               |
+| `tracing`                      | `True` only with `[observability]` installed; sends traces to OTLP |
+| `tool_registry`                | `ToolRegistry` with custom `function` schemas                      |
+| `endpointing`                  | Pause duration (ms) after endpointing                              |
+| `utterance_end`                | Stop recording (ms) when utterance ends                            |
+| `stable_interim_secs`          | Stable interim result delay (secs)                                 |
+| `stable_interim_secs_no_punct` | Same, when no punctuation detected                                 |
+| `inactivity_timeout_seconds`   | Close session after silence (default 10)                           |
+| `max_session_seconds`          | Hard session time cap (`CustomVoiceAgent` only)                    |
 
 ### `CustomVoiceAgent`
+
 Core pipeline class. Same params as `run_voice_session` plus `client_websocket`, `max_session_seconds`, `max_duration_message`, `inactivity_message`.
 
 ### `CustomVoiceAgent`
+
 Core pipeline class. Initialize with `client_websocket` and optional `system_prompt`, `greeting_message`, `session_id`, `model`, `api_key`, `deepgram_api_key`, `tracing`, `tool_registry`.
 
 ### `ToolRegistry`
+
 Dynamic registry for callable tools. Use `.register()` with full `function` schema, `.lookup()` to retrieve, `.schemas()` to get LLM-ready tool definitions.
 
 ## Observability / Tracing
@@ -171,7 +179,13 @@ await run_voice_session(
 
 Jaeger UI: `http://localhost:16686` (search by `session.id`).
 
+**Browser compatibility:** Tested on Chrome and Edge. Firefox may have playback issues due to client-side HTML5 audio/API differences (this is a browser-side issue, not the voice pipeline). Update `index.html` if needed for Firefox.
+
 ## WebSocket Messages
+
+Client must send `{"control": "playback_complete"}` via WebSocket when audio playback finishes so the server can reset `is_ai_speaking` and track inactivity correctly.
+
+**Browser compatibility:** Tested on Chrome and Edge. Firefox may have playback issues due to client-side HTML5 audio/API differences (this is a browser-side issue, not the voice pipeline). Update `index.html` if needed for Firefox.
 
 Server sends JSON over the WebSocket:
 

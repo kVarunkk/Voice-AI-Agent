@@ -83,10 +83,6 @@ document.getElementById('stopBtn').style.display = 'inline-block';
             ws.onmessage = async (event) => {
                 if (typeof event.data === 'string') {
                     const signal = JSON.parse(event.data);
-                    // if (signal.control === "clear_speaker_buffer") {
-                    //     // Drop the AI's queued speech immediately on barge-in.
-                    //     nextPlaybackTime = audioCtx.currentTime;
-                    // }
                     if (signal.control === "clear_speaker_buffer") {
                         nextPlaybackTime = audioCtx.currentTime;
                         activeSources.forEach(src => {
@@ -102,7 +98,6 @@ document.getElementById('stopBtn').style.display = 'inline-block';
     }
 }
                     if (signal.transcript) {
-                        print(signal.transcript)
                         const div = document.createElement('div');
                         div.style.margin = '8px 0';
                         div.style.fontWeight = signal.transcript.role === 'user' ? 'bold' : 'normal';

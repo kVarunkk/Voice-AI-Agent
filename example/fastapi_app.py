@@ -4,13 +4,12 @@ This demonstrates how to use `run_voice_session` with a WebSocket endpoint.
 """
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-import asyncio
 import os
 from dotenv import load_dotenv
 from myvoiceai import run_voice_session
 from myvoiceai.tools import ToolRegistry
 from fastapi.responses import HTMLResponse
-
+from pathlib import Path
 load_dotenv()
 
 GEMINI_API_KEY=os.getenv("GEMINI_API_KEY", "")
@@ -27,10 +26,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+BASE_DIR = Path(__file__).resolve().parent
 
 @app.get("/")
 async def root():
-    with open("static/index.html", "r") as f:
+    html_path = BASE_DIR / "static" / "index.html"
+    with open(html_path, "r") as f:
         return HTMLResponse(content=f.read(), status_code=200)
 
 
@@ -86,12 +87,12 @@ async def voice_session(websocket: WebSocket):
         utterance_end=2500,
         stable_interim_secs=1.5,
         stable_interim_secs_no_punct=3.0,
-        inactivity_timeout_seconds=30,
+        inactivity_timeout_seconds=7,
         tool_registry=my_registry,
         llm_provider_api_key=GEMINI_API_KEY,
         deepgram_api_key=DEEPGRAM_API_KEY,
         session_id="test-001",
-        tracing=True,
+        tracing=False,
     )
 
 

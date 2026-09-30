@@ -1,4 +1,6 @@
 venv
+venv310
+venv311
 __pycache__
 .env
 plan
