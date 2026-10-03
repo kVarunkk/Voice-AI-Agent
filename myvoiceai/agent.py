@@ -131,7 +131,7 @@ class CustomVoiceAgent:
         self._last_activity_ts = time.monotonic()
 
         self._closing = False
-        # self._session_end_event = asyncio.Event()
+        self._session_end_event = asyncio.Event()
         self._tts_flush_event = asyncio.Event()
         self._tts_span_start_ns = None
         self._last_audio_sent_wall_ts = None
@@ -176,8 +176,8 @@ class CustomVoiceAgent:
                         exc_info=task.exception(),
                     )
             
-            # if self._closing:
-            #     await self._session_end_event.wait()
+            if self._closing:
+                await self._session_end_event.wait()
         except Exception:
             logger.exception("Voice session failed (session_id=%s)", self.session_id)        
         finally:
@@ -700,7 +700,7 @@ class CustomVoiceAgent:
         except asyncio.TimeoutError:
             logger.warning("Timed out waiting for Deepgram goodbye audio.")
 
-        # self._session_end_event.set()    
+        self._session_end_event.set()    
     
 
     async def _purge_pipeline(self):
