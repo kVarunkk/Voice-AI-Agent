@@ -700,6 +700,8 @@ class CustomVoiceAgent:
         except asyncio.TimeoutError:
             logger.warning("Timed out waiting for Deepgram goodbye audio.")
 
+        await self.audio_out_queue.join()    
+
         self._session_end_event.set()    
     
 

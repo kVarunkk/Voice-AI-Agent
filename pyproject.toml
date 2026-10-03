@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "myvoiceai"
-version = "0.0.5"
+version = "0.0.6"
 description = "Voice AI agent – real-time WebSocket voice session pipeline"
 readme = "README.md"
 license = "MIT"
